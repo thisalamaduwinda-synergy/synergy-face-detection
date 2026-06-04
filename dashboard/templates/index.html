@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Employee Face Recognition – Dashboard</title>
+  <link rel="stylesheet" href="/static/css/style.css" />
+</head>
+<body>
+
+<!-- ── Top Navigation ─────────────────────────────────────── -->
+<header class="topbar">
+  <div class="topbar-brand">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
+      <circle cx="9" cy="7" r="4"/>
+      <path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+    </svg>
+    Employee Face Recognition
+  </div>
+  <div class="topbar-status">
+    <span id="ws-indicator" class="badge badge-warning">Connecting…</span>
+    <span id="clock" class="topbar-clock"></span>
+  </div>
+</header>
+
+<!-- ── Main Layout ────────────────────────────────────────── -->
+<main class="layout">
+
+  <!-- ── Left panel: Stat cards + Employee roster ──── -->
+  <section class="stats-panel">
+    <div class="stat-card">
+      <div class="stat-value" id="stat-employees">–</div>
+      <div class="stat-label">Registered Employees</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-value" id="stat-total">–</div>
+      <div class="stat-label">Total Detections</div>
+    </div>
+    <div class="stat-card stat-known">
+      <div class="stat-value" id="stat-known">–</div>
+      <div class="stat-label">Known Identified</div>
+    </div>
+    <div class="stat-card stat-unknown">
+      <div class="stat-value" id="stat-unknown">–</div>
+      <div class="stat-label">Unknown Alerts</div>
+    </div>
+
+    <!-- ── Employee Roster ──────────────────────────── -->
+    <div class="emp-section">
+      <div class="emp-section-hdr">
+        <span class="section-title">Employees</span>
+        <button id="open-modal-emp" class="btn-add-emp" title="Add Employee">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" width="13" height="13"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+          Add
+        </button>
+      </div>
+      <div id="emp-list" class="emp-list">
+        <p class="emp-empty">Loading…</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Centre: Tabbed main panel ────────────────── -->
+  <section class="camera-section">
+
+    <!-- Tab navigation -->
+    <div class="tab-nav">
+      <button class="tab-btn active" data-tab="live">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+        Live Cameras
+      </button>
+      <button class="tab-btn" data-tab="attendance">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/><path d="M8 14h.01M12 14h.01M16 14h.01M8 18h.01M12 18h.01"/></svg>
+        Attendance
+      </button>
+      <button class="tab-btn" data-tab="monthly">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M18 20V10M12 20V4M6 20v-6"/></svg>
+        Monthly Report
+      </button>
+    </div>
+
+    <!-- ── Tab: Live ─────────────────────────────── -->
+    <div class="tab-panel" id="tab-live">
+      <div class="live-toolbar">
+        <button class="btn-add-emp" id="open-add-camera-btn">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" width="13" height="13"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+          Add Camera
+        </button>
+      </div>
+      <div class="camera-grid" id="camera-grid">
+        <!-- Camera tiles injected by JS -->
+      </div>
+      <div class="recognition-overlay" id="recognition-overlay">
+        <h3 class="section-title">Current Identifications</h3>
+        <div id="active-ids" class="active-ids"></div>
+      </div>
+    </div>
+
+    <!-- ── Tab: Attendance ───────────────────────── -->
+    <div class="tab-panel hidden" id="tab-attendance">
+      <div class="att-controls">
+        <label class="att-ctrl-label">Date</label>
+        <input type="date" id="att-date" />
+        <button class="btn btn-sm" id="att-refresh">Refresh</button>
+        <span id="att-present-count" class="att-badge att-badge-present">0 present</span>
+        <span id="att-absent-count"  class="att-badge att-badge-absent">0 absent</span>
+        <button class="btn btn-sm btn-outline" id="att-download">⬇ CSV</button>
+        <button class="btn btn-sm btn-outline btn-excel" id="att-download-xl">⬇ Excel</button>
+      </div>
+
+      <div class="att-subsection">
+        <div class="att-subsection-title">Present</div>
+        <div class="att-table-wrap">
+          <table class="att-table" id="att-table">
+            <thead>
+              <tr>
+                <th>Name</th><th>Department</th>
+                <th>In Time</th><th>Out Time</th>
+                <th>Work Hours</th><th>Status</th><th>Confidence</th>
+              </tr>
+            </thead>
+            <tbody id="att-tbody"></tbody>
+          </table>
+          <p class="att-empty hidden" id="att-empty">No attendance records for this date.</p>
+        </div>
+      </div>
+
+      <div class="att-subsection">
+        <div class="att-subsection-title">Absent</div>
+        <div id="absent-chips" class="absent-chips"></div>
+        <p class="att-empty hidden" id="absent-empty">All employees present.</p>
+      </div>
+    </div>
+
+    <!-- ── Tab: Monthly Report ───────────────────── -->
+    <div class="tab-panel hidden" id="tab-monthly">
+      <div class="att-controls">
+        <label class="att-ctrl-label">Month</label>
+        <select id="monthly-month" class="att-select"></select>
+        <select id="monthly-year"  class="att-select" style="width:90px"></select>
+        <button class="btn btn-sm" id="monthly-load">Load</button>
+        <button class="btn btn-sm btn-outline" id="monthly-download">⬇ CSV</button>
+        <button class="btn btn-sm btn-outline btn-excel" id="monthly-download-xl">⬇ Excel</button>
+      </div>
+      <div class="att-table-wrap">
+        <table class="att-table" id="monthly-table">
+          <thead>
+            <tr>
+              <th>Name</th><th>Department</th>
+              <th>Present</th><th>Absent</th><th>Late</th>
+              <th>Total Days</th><th>Rate %</th>
+            </tr>
+          </thead>
+          <tbody id="monthly-tbody"></tbody>
+        </table>
+        <p class="att-empty hidden" id="monthly-empty">No data for this period.</p>
+      </div>
+    </div>
+
+  </section>
+
+  <!-- ── Right panel: Activity feed ────────────────── -->
+  <section class="feed-panel">
+    <div class="feed-header">
+      <h2 class="section-title">Detection Feed</h2>
+      <label class="filter-toggle">
+        <input type="checkbox" id="filter-unknown" />
+        Unknown only
+      </label>
+    </div>
+    <ul id="event-list" class="event-list"></ul>
+  </section>
+
+</main>
+
+<!-- ── Login overlay ──────────────────────────────────────── -->
+<div id="login-overlay" class="login-overlay hidden">
+  <div class="login-card">
+    <div class="login-logo">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="32" height="32">
+        <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
+        <circle cx="9" cy="7" r="4"/>
+        <path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+      </svg>
+    </div>
+    <h2 class="login-title">Employee Face Recognition</h2>
+    <p class="login-subtitle">Enter admin password to continue</p>
+    <form id="login-form">
+      <div class="form-group">
+        <label>Password</label>
+        <input type="password" id="login-password" placeholder="Admin password" autocomplete="current-password" required />
+      </div>
+      <div id="login-error" class="form-feedback error hidden"></div>
+      <button type="submit" class="btn btn-primary" style="width:100%">Login</button>
+    </form>
+  </div>
+</div>
+
+<!-- ── Unknown Alert Toast ────────────────────────────────── -->
+<div id="toast" class="toast hidden">
+  <div class="toast-icon">⚠</div>
+  <div class="toast-body">
+    <strong>Unknown person detected</strong>
+    <span id="toast-cam"></span>
+  </div>
+</div>
+
+<!-- ── Employee Registration Modal ───────────────────────── -->
+<button class="fab" id="open-modal" title="Register New Employee">＋</button>
+
+<!-- ── Employee Detail Modal ─────────────────────────────── -->
+<div id="emp-detail-overlay" class="modal-overlay hidden">
+  <div class="modal">
+    <button class="modal-close" id="close-emp-detail">✕</button>
+    <div id="emp-detail-content"></div>
+  </div>
+</div>
+
+<div id="modal-overlay" class="modal-overlay hidden">
+  <div class="modal">
+    <button class="modal-close" id="close-modal">✕</button>
+    <h2>Register New Employee</h2>
+    <form id="register-form" enctype="multipart/form-data">
+      <div class="form-group">
+        <label>Employee ID *</label>
+        <input type="text" name="employee_id" required placeholder="EMP001" />
+      </div>
+      <div class="form-group">
+        <label>Full Name *</label>
+        <input type="text" name="name" required placeholder="Alice Smith" />
+      </div>
+      <div class="form-group">
+        <label>Department</label>
+        <input type="text" name="department" placeholder="Engineering" />
+      </div>
+      <div class="form-group">
+        <label>Face Capture <small style="color:var(--text-muted)">(straight · left · right · up · down)</small></label>
+        <div class="webcam-section">
+          <div class="step-dots" id="step-dots"></div>
+          <div class="capture-instruction" id="capture-instruction">Press "Start Camera" to begin</div>
+          <div class="webcam-wrap hidden" id="webcam-wrap">
+            <video id="reg-webcam" autoplay muted playsinline disablepictureinpicture></video>
+            <div class="webcam-direction" id="webcam-direction"></div>
+          </div>
+          <canvas id="reg-canvas" style="display:none"></canvas>
+          <div class="capture-thumbs" id="capture-thumbs"></div>
+          <div class="capture-btns">
+            <button type="button" class="btn btn-sm" id="start-webcam-btn">Start Camera</button>
+            <button type="button" class="btn btn-sm btn-capture hidden" id="capture-frame-btn">Capture</button>
+            <button type="button" class="btn btn-sm btn-outline hidden" id="retake-step-btn">Retake</button>
+          </div>
+        </div>
+      </div>
+      <div id="form-feedback" class="form-feedback hidden"></div>
+      <button type="submit" class="btn btn-primary" id="reg-submit-btn" disabled>Register</button>
+    </form>
+  </div>
+</div>
+
+<!-- ── Employee Edit Modal ────────────────────────────────── -->
+<div id="emp-edit-overlay" class="modal-overlay hidden">
+  <div class="modal">
+    <button class="modal-close" id="close-emp-edit">✕</button>
+    <h2>Edit Employee</h2>
+    <form id="emp-edit-form" enctype="multipart/form-data">
+      <input type="hidden" name="employee_id" id="edit-emp-id" />
+      <div class="form-group">
+        <label>Full Name</label>
+        <input type="text" name="name" id="edit-emp-name" placeholder="Leave blank to keep current" />
+      </div>
+      <div class="form-group">
+        <label>Department</label>
+        <input type="text" name="department" id="edit-emp-dept" placeholder="Leave blank to keep current" />
+      </div>
+      <div class="form-group">
+        <label>Replace Face Photos (optional, 1–5)</label>
+        <input type="file" name="photos" accept="image/jpeg,image/png" multiple />
+      </div>
+      <div id="edit-form-feedback" class="form-feedback hidden"></div>
+      <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:4px">
+        <button type="button" class="btn" id="cancel-emp-edit" style="background:var(--surface2)">Cancel</button>
+        <button type="submit" class="btn btn-primary">Save Changes</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- ── Add Camera Modal ───────────────────────────────────── -->
+<div id="add-camera-overlay" class="modal-overlay hidden">
+  <div class="modal">
+    <button class="modal-close" id="close-add-camera">✕</button>
+    <h2>Add Camera</h2>
+    <form id="add-camera-form">
+      <div class="form-group">
+        <label>Camera ID *</label>
+        <input type="text" name="id" required placeholder="cam_ip_02" />
+      </div>
+      <div class="form-group">
+        <label>Name</label>
+        <input type="text" name="name" placeholder="Back Entrance" />
+      </div>
+      <div class="form-group">
+        <label>RTSP / HTTP URL *</label>
+        <input type="text" name="source" required placeholder="rtsp://admin:pass@192.168.1.x:554/stream1" />
+      </div>
+      <div class="form-group">
+        <label>FPS</label>
+        <input type="number" name="fps" value="25" min="1" max="60" />
+      </div>
+      <div id="add-camera-feedback" class="form-feedback hidden"></div>
+      <button type="submit" class="btn btn-primary">Add Camera</button>
+    </form>
+  </div>
+</div>
+
+<script src="/static/js/app.js"></script>
+</body>
+</html>

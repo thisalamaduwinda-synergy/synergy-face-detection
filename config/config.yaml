@@ -1,0 +1,87 @@
+alerts:
+  unknown_person: true
+  webhook_url: ''
+api:
+  host: 0.0.0.0
+  port: 8000
+  workers: 1
+attendance:
+  confidence_threshold: 0.5
+  reports_dir: reports
+  shift_end: '17:00'
+  shift_start: 08:30
+cameras:
+- fps: 15
+  id: frontcam1
+  name: entrance
+  source: rtsp://admin:Synergy2026@192.168.1.64:554/Streaming/Channels/102
+  motion_detection: true
+  motion_threshold: 500
+  motion_only: false
+  resize_width: 640
+dashboard:
+  enabled: true
+  host: 0.0.0.0
+  port: 8080
+database:
+  postgresql:
+    host: localhost
+    name: face_recognition
+    password: ''
+    port: 5432
+    user: postgres
+  sqlite:
+    path: data/employees.db
+  type: sqlite
+detection:
+  backend: insightface
+  det_thresh: 0.45
+  insightface_det_size:
+  - 320
+  - 320
+  insightface_model: buffalo_s
+  insightface_root: data/models/insightface
+  min_face_size: 30
+  nms_thresh: 0.4
+  sface_model: data/models/face_recognition_sface_2021dec.onnx
+  yunet_model: data/models/face_detection_yunet_2023mar.onnx
+email:
+  attach_excel: true
+  enabled: false
+  recipients:
+  - manager@synergypharma.lk
+  sender: your_email@gmail.com
+  smtp_host: smtp.gmail.com
+  smtp_port: 587
+  subject_prefix: Attendance Report
+  use_tls: true
+logging:
+  backup_count: 5
+  file: logs/recognition.log
+  frames_dir: logs/frames
+  level: INFO
+  log_unknown_frames: false
+  max_size_mb: 100
+performance:
+  batch_size: 8
+  display_results: false
+  frame_skip: 3
+  num_threads: 4
+  use_gpu: false
+recognition:
+  embedding_dim: 512
+  threshold: 0.45
+redis:
+  cache_ttl: 300
+  db: 0
+  enabled: false
+  host: localhost
+  port: 6379
+system:
+  debug: false
+  name: Employee Face Recognition System
+  version: 1.0.0
+tracking:
+  cooldown_seconds: 30
+  enabled: true
+  max_distance: 80

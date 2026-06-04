@@ -1,0 +1,62 @@
+# ============================================================
+#  Employee Face Recognition System – Python Dependencies
+# ============================================================
+
+# ── Core vision ─────────────────────────────────────────────
+opencv-python>=4.8.0
+numpy>=1.24.0
+Pillow>=10.0.0
+scipy>=1.11.0
+
+# ── Face detection & embedding  (InsightFace / ArcFace) ─────
+# Note: On some Windows/Python builds only 0.2.1 wheel is available.
+insightface>=0.2.1
+onnxruntime>=1.16.0          # CPU inference
+# onnxruntime-gpu>=1.16.0    # Uncomment for GPU inference
+
+# ── Fast vector similarity search (FAISS) ───────────────────
+faiss-cpu>=1.7.4             # CPU version
+# faiss-gpu>=1.7.4           # Uncomment for GPU version
+
+# ── Web framework & async ───────────────────────────────────
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+websockets>=12.0
+python-multipart>=0.0.6      # File upload support
+aiofiles>=23.2.1
+httpx>=0.25.0                # Async HTTP (for webhooks)
+
+# ── Database & ORM ──────────────────────────────────────────
+sqlalchemy>=2.0.0
+alembic>=1.12.0              # DB migrations
+aiosqlite>=0.19.0            # Async SQLite
+psycopg2-binary>=2.9.0       # PostgreSQL driver (optional)
+
+# ── Config & environment ─────────────────────────────────────
+pyyaml>=6.0.1
+python-dotenv>=1.0.0
+
+# ── Redis (optional caching) ────────────────────────────────
+redis>=5.0.0
+aioredis>=2.0.0
+
+# ── Logging ─────────────────────────────────────────────────
+loguru>=0.7.2
+
+# ── Data & utilities ────────────────────────────────────────
+pydantic>=2.4.0
+pydantic-settings>=2.0.0
+python-jose[cryptography]>=3.3.0   # JWT tokens for API auth
+passlib[bcrypt]>=1.7.4             # Password hashing
+
+# ── Excel export ────────────────────────────────────────────
+openpyxl>=3.1.0
+
+# ── Progress bars & CLI ─────────────────────────────────────
+tqdm>=4.66.0
+click>=8.1.7
+
+# ── Testing ─────────────────────────────────────────────────
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+pytest-cov>=4.1.0

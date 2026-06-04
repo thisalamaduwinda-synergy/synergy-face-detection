@@ -1,0 +1,47 @@
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+*.so
+
+# Environment variables (contains passwords)
+.env
+
+# Database
+data/employees.db
+data/*.db
+
+# Large model files
+data/models/
+
+# Employee photos & face crops (privacy)
+data/employees/
+data/faces/
+data/raw_photos/
+data/test_faces/
+
+# Logs & reports
+logs/
+reports/
+
+# pytest cache
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+*.egg-info/
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# Distribution
+dist/
+build/

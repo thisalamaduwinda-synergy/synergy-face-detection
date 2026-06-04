@@ -1,0 +1,94 @@
+## ============================================================
+## Employee Face Recognition System – Docker Compose
+## ============================================================
+## Services:
+##   face-recognition  – main Python application
+##   redis             – optional event caching / pub-sub
+##
+## Usage:
+##   docker compose up --build
+##   docker compose up -d            # detached
+##   docker compose logs -f          # follow logs
+##   docker compose down             # stop
+
+version: "3.9"
+
+services:
+
+  # ── Main face-recognition service ──────────────────────────
+  face-recognition:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: face-recognition:latest
+    container_name: face-recognition
+    restart: unless-stopped
+    ports:
+      - "8000:8000"    # FastAPI REST + WebSocket
+      - "8080:8080"    # Web Dashboard (if running separately)
+    volumes:
+      # Persist database and logs on the host
+      - ../data:/app/data
+      - ../logs:/app/logs
+      # Mount config so you can edit without rebuilding
+      - ../config:/app/config:ro
+    environment:
+      - DB_TYPE=sqlite
+      - SQLITE_PATH=data/employees.db
+      - REDIS_ENABLED=false
+      - LOG_LEVEL=INFO
+      - USE_GPU=false
+    depends_on:
+      - redis
+    networks:
+      - frnet
+    # Override to a specific camera config or no-camera test mode:
+    # command: ["python", "main.py", "--config", "config/config.yaml", "--no-video"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/stats"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ── Redis (optional) ────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    networks:
+      - frnet
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ── PostgreSQL (optional – uncomment to use instead of SQLite) ─
+  # postgres:
+  #   image: postgres:16-alpine
+  #   container_name: postgres
+  #   restart: unless-stopped
+  #   environment:
+  #     POSTGRES_DB: face_recognition
+  #     POSTGRES_USER: postgres
+  #     POSTGRES_PASSWORD: ${PG_PASSWORD:-changeme}
+  #   ports:
+  #     - "5432:5432"
+  #   volumes:
+  #     - pg-data:/var/lib/postgresql/data
+  #   networks:
+  #     - frnet
+
+volumes:
+  redis-data:
+  # pg-data:
+
+networks:
+  frnet:
+    driver: bridge
