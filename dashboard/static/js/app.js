@@ -262,21 +262,34 @@
         addCameraCard(camId, stats);
         knownCameraIds.add(camId);
       } else {
-        // Update FPS
         const fpsEl = document.getElementById(`cam-fps-${camId}`);
         if (fpsEl) fpsEl.textContent = `${stats.fps} fps`;
+        const resEl = document.getElementById(`cam-res-${camId}`);
+        if (resEl) resEl.textContent = resBadge(stats);
+        // Keep latest stats on the settings button so modal sees fresh values
+        const btn = document.querySelector(`#cam-tile-${camId} .cam-settings-btn`);
+        if (btn) btn._stats = stats;
       }
     });
+  }
+
+  function resBadge(stats) {
+    if (stats.resize_width && stats.resize_height)
+      return `${stats.resize_width}×${stats.resize_height}`;
+    return "";
   }
 
   function addCameraCard(camId, stats) {
     const tile = document.createElement("div");
     tile.className = "camera-tile";
     tile.id = `cam-tile-${camId}`;
+    const res = resBadge(stats);
     tile.innerHTML = `
       <div class="camera-tile-header">
         <span class="camera-name">${escHtml(camId)}</span>
         <span class="camera-fps" id="cam-fps-${camId}">${stats.fps} fps</span>
+        ${res ? `<span class="camera-res" id="cam-res-${escHtml(camId)}">${escHtml(res)}</span>` : `<span class="camera-res" id="cam-res-${escHtml(camId)}"></span>`}
+        <button class="cam-settings-btn" data-id="${escHtml(camId)}" title="Camera settings">⚙</button>
         <button class="cam-remove-btn" data-id="${escHtml(camId)}" title="Remove camera">✕</button>
       </div>
       <img
@@ -298,6 +311,10 @@
         const j = await res.json().catch(() => ({}));
         alert(`Failed to remove: ${j.detail || "Unknown error"}`);
       }
+    });
+    tile.querySelector(".cam-settings-btn").addEventListener("click", (e) => {
+      e.stopPropagation();
+      openCamSettings(e.currentTarget.dataset.id, stats);
     });
     $cameraGrid.appendChild(tile);
   }
@@ -794,6 +811,7 @@
 
       if (target === "attendance") loadAttendance();
       if (target === "monthly")    loadMonthly();
+      if (target === "settings" && !_settingsLoaded) loadSettings();
     });
   });
 
@@ -1076,6 +1094,287 @@
       .replace(/>/g, "&gt;")
       .replace(/"/g, "&quot;")
       .replace(/'/g, "&#x27;");
+  }
+
+  // ── Settings tab ──────────────────────────────────────────
+  let _settingsLoaded = false;
+
+  function syncRange(rangeId, numId) {
+    const range = document.getElementById(rangeId);
+    const num   = document.getElementById(numId);
+    if (!range || !num) return;
+    range.addEventListener("input", () => { num.value = range.value; });
+    num.addEventListener("input",   () => { range.value = num.value; });
+  }
+
+  syncRange("set-rec-threshold",  "set-rec-threshold-num");
+  syncRange("set-det-thresh",     "set-det-thresh-num");
+  syncRange("set-att-confidence", "set-att-confidence-num");
+
+  async function loadSettings() {
+    try {
+      const res = await authFetch(`${API_BASE}/api/settings`);
+      if (!res.ok) return;
+      const s = await res.json();
+
+      // Detection & Recognition
+      const rec = s.recognition || {};
+      const det = s.detection   || {};
+      const trk = s.tracking    || {};
+      setVal("set-rec-threshold",     rec.threshold          ?? 0.45);
+      setVal("set-rec-threshold-num", rec.threshold          ?? 0.45);
+      setVal("set-det-thresh",        det.det_thresh         ?? 0.45);
+      setVal("set-det-thresh-num",    det.det_thresh         ?? 0.45);
+      setVal("set-min-face",          det.min_face_size      ?? 30);
+      setVal("set-track-cooldown",    trk.cooldown_seconds   ?? 30);
+      setVal("set-track-dist",        trk.max_distance       ?? 80);
+
+      // Alarm & Alerts
+      const al  = s.alarm  || {};
+      const alt = s.alerts || {};
+      setChecked("set-alarm-enabled",  al.enabled          ?? false);
+      setChecked("set-alert-unknown",  alt.unknown_person  ?? true);
+      setVal("set-alarm-cooldown",     al.cooldown_seconds ?? 30);
+      setVal("set-alarm-sound",        al.sound            ?? "voice");
+      setVal("set-alarm-output",       al.output           ?? "local");
+      setVal("set-alarm-voice-text",   al.voice_text       ?? "Intruder alert!");
+      setVal("set-webhook-url",        alt.webhook_url     ?? "");
+
+      // Camera defaults
+      const perf = s.performance || {};
+      // rtsp_transport lives on each camera; show first camera's value or default
+      setVal("set-frame-skip",  perf.frame_skip  ?? 1);
+      setVal("set-batch-size",  perf.batch_size  ?? 8);
+
+      // System
+      const log = s.logging    || {};
+      const att = s.attendance || {};
+      setVal("set-log-level",          log.level                  ?? "INFO");
+      setChecked("set-log-unknown-frames", log.log_unknown_frames ?? false);
+      setVal("set-att-confidence",     att.confidence_threshold   ?? 0.45);
+      setVal("set-att-confidence-num", att.confidence_threshold   ?? 0.45);
+      setVal("set-shift-start",        att.shift_start            ?? "");
+      setVal("set-shift-end",          att.shift_end              ?? "");
+
+      _settingsLoaded = true;
+    } catch (e) {
+      console.warn("Settings load error:", e);
+    }
+  }
+
+  function setVal(id, val) {
+    const el = document.getElementById(id);
+    if (el) el.value = val ?? "";
+  }
+  function setChecked(id, val) {
+    const el = document.getElementById(id);
+    if (el) el.checked = Boolean(val);
+  }
+
+  function showSettingsFeedback(id, type, msg) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.className = `settings-feedback ${type}`;
+    el.textContent = msg;
+    setTimeout(() => { el.className = "settings-feedback hidden"; }, 3500);
+  }
+
+  async function saveSettings(payload, feedbackId) {
+    try {
+      const res = await authFetch(`${API_BASE}/api/settings`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const json = await res.json();
+      if (res.ok) {
+        const liveMsg = json.live_updated?.length
+          ? ` (live: ${json.live_updated.join(", ")})`
+          : "";
+        const restartMsg = json.needs_restart?.length
+          ? ` · restart required for: ${json.needs_restart.join(", ")}`
+          : "";
+        showSettingsFeedback(feedbackId, "success", `✓ Saved${liveMsg}${restartMsg}`);
+      } else {
+        showSettingsFeedback(feedbackId, "error", `✗ ${json.detail || "Save failed."}`);
+      }
+    } catch {
+      showSettingsFeedback(feedbackId, "error", "✗ Network error — please try again.");
+    }
+  }
+
+  // Recognition & Detection form
+  const $sfRecognition = document.getElementById("settings-form-recognition");
+  if ($sfRecognition) {
+    $sfRecognition.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      await saveSettings({
+        recognition: { threshold:    parseFloat(document.getElementById("set-rec-threshold").value) },
+        detection:   { det_thresh:   parseFloat(document.getElementById("set-det-thresh").value),
+                       min_face_size: parseInt(document.getElementById("set-min-face").value, 10) },
+        tracking:    { cooldown_seconds: parseFloat(document.getElementById("set-track-cooldown").value),
+                       max_distance:     parseInt(document.getElementById("set-track-dist").value, 10) },
+      }, "settings-feedback-recognition");
+    });
+  }
+
+  // Alarm & Alerts form
+  const $sfAlarm = document.getElementById("settings-form-alarm");
+  if ($sfAlarm) {
+    $sfAlarm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      await saveSettings({
+        alarm: {
+          enabled:          document.getElementById("set-alarm-enabled").checked,
+          cooldown_seconds: parseFloat(document.getElementById("set-alarm-cooldown").value),
+          sound:            document.getElementById("set-alarm-sound").value,
+          output:           document.getElementById("set-alarm-output").value,
+          voice_text:       document.getElementById("set-alarm-voice-text").value,
+        },
+        alerts: {
+          unknown_person: document.getElementById("set-alert-unknown").checked,
+          webhook_url:    document.getElementById("set-webhook-url").value.trim(),
+        },
+      }, "settings-feedback-alarm");
+    });
+  }
+
+  // Camera defaults form
+  const $sfCamera = document.getElementById("settings-form-camera");
+  if ($sfCamera) {
+    $sfCamera.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      await saveSettings({
+        performance: {
+          frame_skip: parseInt(document.getElementById("set-frame-skip").value, 10),
+          batch_size: parseInt(document.getElementById("set-batch-size").value, 10),
+        },
+      }, "settings-feedback-camera");
+    });
+  }
+
+  // System form
+  const $sfSystem = document.getElementById("settings-form-system");
+  if ($sfSystem) {
+    $sfSystem.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const shiftStart = document.getElementById("set-shift-start").value || null;
+      const shiftEnd   = document.getElementById("set-shift-end").value   || null;
+      await saveSettings({
+        logging: {
+          level:              document.getElementById("set-log-level").value,
+          log_unknown_frames: document.getElementById("set-log-unknown-frames").checked,
+        },
+        attendance: {
+          confidence_threshold: parseFloat(document.getElementById("set-att-confidence").value),
+          shift_start:          shiftStart,
+          shift_end:            shiftEnd,
+        },
+      }, "settings-feedback-system");
+    });
+  }
+
+  // ── Camera Settings modal ──────────────────────────────────
+  const PRESETS = {
+    "480":  { w: 854,  h: 480  },
+    "720":  { w: 1280, h: 720  },
+    "1080": { w: 1920, h: 1080 },
+  };
+
+  const $camSettingsOverlay  = document.getElementById("cam-settings-overlay");
+  const $closeCamSettings    = document.getElementById("close-cam-settings");
+  const $cancelCamSettings   = document.getElementById("cancel-cam-settings");
+  const $camSettingsForm     = document.getElementById("cam-settings-form");
+  const $camSettingsId       = document.getElementById("cam-settings-id");
+  const $camSettingsName     = document.getElementById("cam-settings-cam-name");
+  const $camSettingsPreset   = document.getElementById("cam-settings-preset");
+  const $camSettingsCustomRow = document.getElementById("cam-settings-custom-row");
+  const $camSettingsW        = document.getElementById("cam-settings-w");
+  const $camSettingsH        = document.getElementById("cam-settings-h");
+  const $camSettingsFeedback = document.getElementById("cam-settings-feedback");
+
+  function openCamSettings(camId, stats) {
+    $camSettingsId.value = camId;
+    $camSettingsName.textContent = `Camera: ${camId}`;
+
+    // Pre-select the closest preset
+    const w = stats.resize_width  || 0;
+    const h = stats.resize_height || 0;
+    let matched = "custom";
+    for (const [key, p] of Object.entries(PRESETS)) {
+      if (p.w === w && p.h === h) { matched = key; break; }
+    }
+    $camSettingsPreset.value = matched;
+    $camSettingsW.value = w || 1280;
+    $camSettingsH.value = h || 720;
+    $camSettingsCustomRow.classList.toggle("hidden", matched !== "custom");
+    $camSettingsFeedback.className = "form-feedback hidden";
+    $camSettingsOverlay.classList.remove("hidden");
+  }
+
+  function closeCamSettings() {
+    $camSettingsOverlay.classList.add("hidden");
+    $camSettingsFeedback.className = "form-feedback hidden";
+  }
+
+  if ($closeCamSettings)  $closeCamSettings.addEventListener("click",  closeCamSettings);
+  if ($cancelCamSettings) $cancelCamSettings.addEventListener("click", closeCamSettings);
+  if ($camSettingsOverlay) {
+    $camSettingsOverlay.addEventListener("click", (e) => {
+      if (e.target === $camSettingsOverlay) closeCamSettings();
+    });
+  }
+
+  if ($camSettingsPreset) {
+    $camSettingsPreset.addEventListener("change", () => {
+      const v = $camSettingsPreset.value;
+      if (v === "custom") {
+        $camSettingsCustomRow.classList.remove("hidden");
+      } else {
+        $camSettingsCustomRow.classList.add("hidden");
+        const p = PRESETS[v];
+        $camSettingsW.value = p.w;
+        $camSettingsH.value = p.h;
+      }
+    });
+  }
+
+  if ($camSettingsForm) {
+    $camSettingsForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const camId = $camSettingsId.value;
+      const w = parseInt($camSettingsW.value, 10);
+      const h = parseInt($camSettingsH.value, 10);
+
+      if (!w || !h || w < 160 || h < 120) {
+        $camSettingsFeedback.className = "form-feedback error";
+        $camSettingsFeedback.textContent = "✗ Enter a valid resolution (min 160 × 120).";
+        return;
+      }
+
+      $camSettingsFeedback.className = "form-feedback hidden";
+      try {
+        const res = await authFetch(`${API_BASE}/api/cameras/${encodeURIComponent(camId)}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ width: w, height: h }),
+        });
+        const json = await res.json();
+        if (res.ok) {
+          $camSettingsFeedback.className = "form-feedback success";
+          $camSettingsFeedback.textContent = `✓ Resolution set to ${w}×${h}`;
+          const resEl = document.getElementById(`cam-res-${camId}`);
+          if (resEl) resEl.textContent = `${w}×${h}`;
+          setTimeout(closeCamSettings, 1200);
+        } else {
+          $camSettingsFeedback.className = "form-feedback error";
+          $camSettingsFeedback.textContent = `✗ ${json.detail || "Failed to update."}`;
+        }
+      } catch {
+        $camSettingsFeedback.className = "form-feedback error";
+        $camSettingsFeedback.textContent = "✗ Network error — please try again.";
+      }
+    });
   }
 
   // ── Initialise ─────────────────────────────────────────────

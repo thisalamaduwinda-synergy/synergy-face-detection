@@ -103,6 +103,10 @@ def create_app(
     face_detector,    # FaceDetector (for annotation in stream)
     config: Dict,
     attendance_exporter=None,  # AttendanceExporter (optional)
+    door_controller=None,      # DoorController (optional)
+    pipeline=None,             # RecognitionPipeline (optional, for hot-add)
+    tracker=None,              # FaceTracker  (optional, for live settings update)
+    alarm_svc=None,            # AlarmService (optional, for live settings update)
 ) -> FastAPI:
 
     app = FastAPI(
@@ -567,6 +571,10 @@ def create_app(
         stream = camera_manager.add_camera(cam_id, source, fps=fps)
         stream.start()
 
+        # Start the recognition processing thread for the new camera
+        if pipeline is not None:
+            pipeline.add_camera(cam_id)
+
         try:
             import yaml as _yaml
             cfg_path = BASE_DIR / "config" / "config.yaml"
@@ -581,6 +589,54 @@ def create_app(
             logger.warning("Camera added to runtime but config save failed: %s", exc)
 
         return {"message": f"Camera '{cam_id}' added.", "camera_id": cam_id, "name": name}
+
+    @app.patch("/api/cameras/{camera_id}", status_code=status.HTTP_200_OK)
+    async def update_camera_api(camera_id: str, request: Request, _: None = Depends(require_auth)):
+        """Update camera resolution (and optionally FPS) at runtime."""
+        cam = camera_manager.get_camera(camera_id)
+        if cam is None:
+            raise HTTPException(status_code=404, detail=f"Camera '{camera_id}' not found.")
+
+        body = await request.json()
+        changed = False
+
+        if "width" in body and "height" in body:
+            cam.resize_width  = max(0, int(body["width"]))
+            cam.resize_height = max(0, int(body["height"]))
+            changed = True
+
+        if "fps" in body:
+            cam.target_fps = max(1, min(60, int(body["fps"])))
+            changed = True
+
+        if not changed:
+            raise HTTPException(status_code=400, detail="No valid fields to update.")
+
+        # Persist to config.yaml
+        try:
+            import yaml as _yaml
+            cfg_path = BASE_DIR / "config" / "config.yaml"
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                raw_cfg = _yaml.safe_load(f)
+            for c in raw_cfg.get("cameras", []):
+                if c.get("id") == camera_id:
+                    if "width" in body and "height" in body:
+                        c["resize_width"]  = cam.resize_width
+                        c["resize_height"] = cam.resize_height
+                    if "fps" in body:
+                        c["fps"] = cam.target_fps
+                    break
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                _yaml.dump(raw_cfg, f, default_flow_style=False, allow_unicode=True)
+        except Exception as exc:
+            logger.warning("Camera settings updated but config save failed: %s", exc)
+
+        return {
+            "camera_id": camera_id,
+            "resize_width": cam.resize_width,
+            "resize_height": cam.resize_height,
+            "fps": cam.target_fps,
+        }
 
     @app.delete("/api/cameras/{camera_id}", status_code=status.HTTP_200_OK)
     async def remove_camera_api(camera_id: str, _: None = Depends(require_auth)):
@@ -602,6 +658,125 @@ def create_app(
             logger.warning("Camera removed from runtime but config save failed: %s", exc)
 
         return {"message": f"Camera '{camera_id}' removed."}
+
+    # ═══════════════════════════════════════════════════════
+    # Settings endpoints
+    # ═══════════════════════════════════════════════════════
+
+    @app.get("/api/settings")
+    async def get_settings(_: None = Depends(require_auth)):
+        """Return all editable config sections."""
+        import yaml as _yaml
+        cfg_path = BASE_DIR / "config" / "config.yaml"
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                raw = _yaml.safe_load(f) or {}
+        except Exception:
+            raw = {}
+        return {
+            "detection":    raw.get("detection",    {}),
+            "recognition":  raw.get("recognition",  {}),
+            "tracking":     raw.get("tracking",     {}),
+            "alarm":        raw.get("alarm",        {}),
+            "alerts":       raw.get("alerts",       {}),
+            "attendance":   raw.get("attendance",   {}),
+            "logging":      raw.get("logging",      {}),
+            "performance":  raw.get("performance",  {}),
+        }
+
+    @app.patch("/api/settings", status_code=status.HTTP_200_OK)
+    async def update_settings(request: Request, _: None = Depends(require_auth)):
+        """Save settings to config.yaml; update in-memory state where possible."""
+        import yaml as _yaml
+        body = await request.json()
+        cfg_path = BASE_DIR / "config" / "config.yaml"
+
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                raw = _yaml.safe_load(f) or {}
+        except Exception:
+            raw = {}
+
+        live_updated: list = []
+        needs_restart: list = []
+
+        # ── Recognition threshold (live) ───────────────────
+        if "recognition" in body:
+            rec = body["recognition"]
+            raw.setdefault("recognition", {}).update(rec)
+            if recognizer and "threshold" in rec:
+                recognizer.threshold = float(rec["threshold"])
+                live_updated.append("recognition.threshold")
+
+        # ── Tracking cooldown / distance (live) ────────────
+        if "tracking" in body:
+            trk = body["tracking"]
+            raw.setdefault("tracking", {}).update(trk)
+            if tracker:
+                if "cooldown_seconds" in trk:
+                    tracker.cooldown = float(trk["cooldown_seconds"])
+                    live_updated.append("tracking.cooldown_seconds")
+                if "max_distance" in trk:
+                    tracker.max_distance = int(trk["max_distance"])
+                    live_updated.append("tracking.max_distance")
+
+        # ── Alarm service (live) ───────────────────────────
+        if "alarm" in body:
+            al = body["alarm"]
+            raw.setdefault("alarm", {}).update(al)
+            if alarm_svc:
+                for attr in ("enabled", "cooldown", "sound", "output", "voice_text"):
+                    key = "cooldown_seconds" if attr == "cooldown" else attr
+                    if key in al:
+                        val = float(al[key]) if attr == "cooldown" else al[key]
+                        if attr == "enabled":
+                            val = bool(al[key])
+                        setattr(alarm_svc, attr, val)
+                        live_updated.append(f"alarm.{key}")
+
+        # ── Alerts / webhook (live) ────────────────────────
+        if "alerts" in body:
+            raw.setdefault("alerts", {}).update(body["alerts"])
+            if logging_svc:
+                if "webhook_url" in body["alerts"]:
+                    logging_svc.webhook_url = body["alerts"]["webhook_url"]
+                    live_updated.append("alerts.webhook_url")
+                if "unknown_person" in body["alerts"]:
+                    logging_svc.unknown_alert = bool(body["alerts"]["unknown_person"])
+                    live_updated.append("alerts.unknown_person")
+
+        # ── Detection (restart needed for model changes) ───
+        if "detection" in body:
+            raw.setdefault("detection", {}).update(body["detection"])
+            needs_restart.append("detection")
+
+        # ── Attendance ─────────────────────────────────────
+        if "attendance" in body:
+            raw.setdefault("attendance", {}).update(body["attendance"])
+            needs_restart.append("attendance")
+
+        # ── Logging ────────────────────────────────────────
+        if "logging" in body:
+            raw.setdefault("logging", {}).update(body["logging"])
+            needs_restart.append("logging")
+
+        # ── Performance ────────────────────────────────────
+        if "performance" in body:
+            raw.setdefault("performance", {}).update(body["performance"])
+            needs_restart.append("performance")
+
+        # Save to disk
+        try:
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                _yaml.dump(raw, f, default_flow_style=False, allow_unicode=True)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Config save failed: {exc}")
+
+        return {
+            "message": "Settings saved.",
+            "live_updated": live_updated,
+            "needs_restart": needs_restart,
+        }
 
     # ═══════════════════════════════════════════════════════
     # Attendance endpoints
@@ -801,6 +976,29 @@ def create_app(
             media_type="text/csv",
             headers={"Content-Disposition": f"attachment; filename={filename}"},
         )
+
+    # ═══════════════════════════════════════════════════════
+    # Door control endpoints
+    # ═══════════════════════════════════════════════════════
+
+    @app.get("/api/door/status")
+    async def get_door_status(_: None = Depends(require_auth)):
+        """Return current door controller status."""
+        if door_controller is None:
+            return {"enabled": False, "message": "Door controller not initialised"}
+        return door_controller.get_status()
+
+    @app.post("/api/door/open")
+    async def manual_door_open(_: None = Depends(require_auth)):
+        """Manually trigger the door to open (admin only)."""
+        if door_controller is None:
+            raise HTTPException(status_code=503, detail="Door controller not initialised")
+        if not door_controller.enabled:
+            raise HTTPException(status_code=503, detail="Door controller is disabled in config")
+        ok = door_controller.manual_open()
+        if not ok:
+            raise HTTPException(status_code=500, detail="Door trigger failed")
+        return {"message": "Door opened", "open_duration": door_controller.open_duration}
 
     # ═══════════════════════════════════════════════════════
     # MJPEG video stream

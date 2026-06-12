@@ -16,19 +16,22 @@ employee is added or removed.
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
 try:
-    import faiss
+    import faiss as faiss   # noqa: PLC0414  (re-bind so type-checker sees it as bound)
     FAISS_AVAILABLE = True
 except ImportError:
+    faiss = None  # type: ignore[assignment]
     FAISS_AVAILABLE = False
     logger.warning("faiss not installed – recognition unavailable.")
 
@@ -86,7 +89,7 @@ class FaceRecognizer:
 
         # FAISS index – IndexFlatIP computes dot-products.
         # For L2-normalised vectors: dot-product == cosine similarity.
-        self._index: faiss.IndexFlatIP = faiss.IndexFlatIP(self.dim)
+        self._index: Any = faiss.IndexFlatIP(self.dim)  # type: ignore[union-attr]
 
         # Parallel array: position i in the index → employee metadata dict
         self._id_map: List[Dict] = []
@@ -103,7 +106,7 @@ class FaceRecognizer:
           employee_id, name, department, face_embedding (np.ndarray or bytes)
         """
         with self._lock:
-            self._index = faiss.IndexFlatIP(self.dim)
+            self._index = faiss.IndexFlatIP(self.dim)  # type: ignore[union-attr]
             self._id_map = []
 
             valid = []
@@ -181,7 +184,7 @@ class FaceRecognizer:
     def clear(self) -> None:
         """Remove all entries from the index."""
         with self._lock:
-            self._index = faiss.IndexFlatIP(self.dim)
+            self._index = faiss.IndexFlatIP(self.dim)  # type: ignore[union-attr]
             self._id_map = []
 
     # ── Recognition ─────────────────────────────────────────
@@ -367,27 +370,57 @@ class FaceTracker:
         """
         Returns True if this detection event should be written to the log.
         Updates internal track state regardless.
+
+        Known employees  → tracked by employee_id (one track per person).
+        Unknown persons  → tracked by position; each spatially distinct
+                           unknown gets its own track so multiple unknowns
+                           in the same frame are all logged independently.
         """
         now = time.time()
-        emp_id = result.employee_id
 
+        if result.employee_id is not None:
+            return self._should_log_known(result.employee_id, center, now)
+        else:
+            return self._should_log_unknown(center, now)
+
+    def _should_log_known(self, emp_id: str, center: Tuple[int, int], now: float) -> bool:
         with self._lock:
             track = self._tracks.get(emp_id)
-
             if track is None:
-                # First time seeing this employee
                 self._tracks[emp_id] = _Track(emp_id, now, center, now)
                 return True
-
-            # Update last_seen
             track.last_seen = now
             track.center = center
-
-            # Check cooldown
             if now - track.last_logged >= self.cooldown:
                 track.last_logged = now
                 return True
+        return False
 
+    def _should_log_unknown(self, center: Tuple[int, int], now: float) -> bool:
+        with self._lock:
+            # Find the nearest existing unknown track within max_distance
+            best_track = None
+            best_dist = float(self.max_distance)
+            for key, track in self._tracks.items():
+                if not key.startswith("unk_"):
+                    continue
+                dist = math.hypot(center[0] - track.center[0], center[1] - track.center[1])
+                if dist < best_dist:
+                    best_dist = dist
+                    best_track = track
+
+            if best_track is None:
+                # New unknown at this position — create a unique track
+                key = f"unk_{uuid.uuid4().hex[:8]}"
+                self._tracks[key] = _Track(key, now, center, now)
+                return True
+
+            # Same unknown person seen before — apply cooldown
+            best_track.last_seen = now
+            best_track.center = center
+            if now - best_track.last_logged >= self.cooldown:
+                best_track.last_logged = now
+                return True
         return False
 
     def cleanup_stale(self, max_age: float = 300.0) -> None:

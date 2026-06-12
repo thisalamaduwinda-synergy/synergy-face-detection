@@ -27,6 +27,7 @@ from typing import Dict, List, Optional
 import cv2
 import numpy as np
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -67,6 +68,8 @@ class CameraStream:
         motion_threshold: int = 500,   # minimum pixel area to count as motion
         motion_only: bool = False,     # skip frames with no motion
         resize_width: int = 0,         # resize frame width at capture (0 = no resize)
+        resize_height: int = 0,        # resize frame height at capture (0 = no resize)
+        rtsp_transport: str = "udp",   # udp (low-latency LAN) or tcp (reliable/WiFi)
     ) -> None:
         self.camera_id = camera_id
         self.source = source
@@ -78,8 +81,16 @@ class CameraStream:
         self.motion_threshold = motion_threshold
         self.motion_only = motion_only
         self.resize_width = max(0, resize_width)
+        self.resize_height = max(0, resize_height)
+        self.rtsp_transport = rtsp_transport  # "udp" or "tcp"
 
         self._frame_queue: queue.Queue[Frame] = queue.Queue(maxsize=buffer_size)
+        # Latest-frame slot: always holds the most recent captured frame.
+        # Recognition reads this so it never processes a stale buffered frame.
+        self._latest_frame: Optional[Frame] = None
+        self._latest_lock = threading.Lock()
+        self._latest_event = threading.Event()
+
         self._cap: Optional[cv2.VideoCapture] = None
         self._thread: Optional[threading.Thread] = None
         self._running = False
@@ -179,12 +190,16 @@ class CameraStream:
     def _open_network_capture(self, candidate: str) -> Optional[cv2.VideoCapture]:
         """Open a network stream using the most reliable backend available."""
         if candidate.lower().startswith("rtsp://"):
-            # OpenCV's FFmpeg backend is usually the most stable choice for Hikvision RTSP.
-            # fflags=nobuffer+discardcorrupt minimizes decode latency on the camera side.
+            transport = self.rtsp_transport  # "udp" = low latency LAN, "tcp" = reliable/WiFi
             os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
-                "rtsp_transport;tcp|stimeout;2000000"
-                "|fflags;nobuffer+discardcorrupt|flags;low_delay"
-                "|max_delay;0|reorder_queue_size;0"
+                f"rtsp_transport;{transport}"
+                "|stimeout;2000000"
+                "|fflags;nobuffer+discardcorrupt"
+                "|flags;low_delay"
+                "|max_delay;0"
+                "|reorder_queue_size;0"
+                "|probesize;32"
+                "|analyzeduration;0"
             )
             for backend in (cv2.CAP_FFMPEG, cv2.CAP_ANY):
                 cap = cv2.VideoCapture(candidate, backend)
@@ -311,6 +326,29 @@ class CameraStream:
         area = sum(cv2.contourArea(c) for c in contours if cv2.contourArea(c) > 50)
         return area >= self.motion_threshold, area
 
+    def _read_live_frame(self) -> tuple[bool, Optional[np.ndarray]]:
+        """Return the most recent frame from the camera with zero buffer lag.
+
+        grab() reads compressed data without decoding — it is nearly instant
+        when frames are already buffered inside FFmpeg.  We keep grabbing until
+        grab() blocks for > 5 ms (meaning it had to wait for the network), which
+        tells us the buffer is empty and we are now truly live.  We then decode
+        only that last grabbed frame with retrieve().
+        """
+        if self._cap is None:
+            return False, None
+        if not self._cap.grab():
+            return False, None
+        # Drain any stale frames from FFmpeg's internal buffer.
+        for _ in range(60):
+            t0 = time.monotonic()
+            if not self._cap.grab():
+                break
+            if (time.monotonic() - t0) * 1000 > 5.0:
+                # grab() waited for the network — buffer is drained, we are live
+                break
+        return self._cap.retrieve()
+
     def _capture_loop(self) -> None:
         """Main loop: connect → read → buffer frames → reconnect on error."""
         while self._running:
@@ -343,9 +381,9 @@ class CameraStream:
 
             failures = 0
             while self._running:
-                ret, raw = self._cap.read()
+                ret, raw = self._read_live_frame()
 
-                if not ret:
+                if not ret or raw is None:
                     failures += 1
                     if failures >= 5:
                         self._connected = False
@@ -370,7 +408,16 @@ class CameraStream:
                     self._last_fps_ts = time.time()
 
                 # Resize at capture time so all consumers (detection + streaming) benefit
-                if self.resize_width and raw.shape[1] > self.resize_width:
+                if self.resize_width and self.resize_height:
+                    # Exact resolution (e.g. 1280×720)
+                    if raw.shape[1] != self.resize_width or raw.shape[0] != self.resize_height:
+                        raw = cv2.resize(
+                            raw,
+                            (self.resize_width, self.resize_height),
+                            interpolation=cv2.INTER_LINEAR,
+                        )
+                elif self.resize_width and raw.shape[1] > self.resize_width:
+                    # Width-only — maintain aspect ratio
                     scale = self.resize_width / raw.shape[1]
                     raw = cv2.resize(
                         raw,
@@ -394,6 +441,12 @@ class CameraStream:
                     motion_area=motion_area,
                 )
 
+                # Always update the latest-frame slot so recognition
+                # never reads a stale buffered frame.
+                with self._latest_lock:
+                    self._latest_frame = frame_obj
+                self._latest_event.set()
+
                 # Non-blocking enqueue: drop oldest frame when buffer is full
                 if self._frame_queue.full():
                     try:
@@ -413,6 +466,20 @@ class CameraStream:
             return self._frame_queue.get(timeout=timeout)
         except queue.Empty:
             return None
+
+    def read_latest(self, timeout: float = 0.15) -> Optional[Frame]:
+        """Return the most recently captured frame.
+
+        Unlike read(), this never returns a stale buffered frame — it always
+        gives the newest frame the capture thread has written. Use this for
+        the recognition pipeline to prevent lag accumulation over time.
+        """
+        signalled = self._latest_event.wait(timeout=timeout)
+        if not signalled:
+            return None
+        self._latest_event.clear()
+        with self._latest_lock:
+            return self._latest_frame
 
     @property
     def fps(self) -> float:
@@ -441,6 +508,8 @@ class CameraStream:
             "status": "connected" if self._connected else (
                 "reconnecting" if self._running else "stopped"
             ),
+            "resize_width": self.resize_width,
+            "resize_height": self.resize_height,
         }
 
 
@@ -480,6 +549,8 @@ class MultiCameraManager:
                 motion_threshold=cam.get("motion_threshold", 500),
                 motion_only=cam.get("motion_only", False),
                 resize_width=cam.get("resize_width", 0),
+                resize_height=cam.get("resize_height", 0),
+                rtsp_transport=cam.get("rtsp_transport", "udp"),
             )
 
     # ── Lifecycle ───────────────────────────────────────────

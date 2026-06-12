@@ -78,6 +78,10 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M18 20V10M12 20V4M6 20v-6"/></svg>
         Monthly Report
       </button>
+      <button class="tab-btn" data-tab="settings">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        Settings
+      </button>
     </div>
 
     <!-- ── Tab: Live ─────────────────────────────── -->
@@ -155,6 +159,187 @@
           <tbody id="monthly-tbody"></tbody>
         </table>
         <p class="att-empty hidden" id="monthly-empty">No data for this period.</p>
+      </div>
+    </div>
+
+    <!-- ── Tab: Settings ────────────────────────────── -->
+    <div class="tab-panel hidden" id="tab-settings">
+      <div class="settings-grid">
+
+        <!-- ① Detection & Recognition -->
+        <div class="settings-card">
+          <div class="settings-card-title">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+            Detection &amp; Recognition
+          </div>
+          <form class="settings-form" id="settings-form-recognition">
+            <div class="settings-row">
+              <label>Recognition confidence <span class="settings-hint">min match to identify an employee</span></label>
+              <div class="settings-range-row">
+                <input type="range" id="set-rec-threshold" min="0.1" max="0.95" step="0.05" value="0.45" />
+                <input type="number" id="set-rec-threshold-num" min="0.1" max="0.95" step="0.05" value="0.45" class="settings-num" />
+              </div>
+            </div>
+            <div class="settings-row">
+              <label>Detection confidence <span class="settings-hint">min score to detect a face</span></label>
+              <div class="settings-range-row">
+                <input type="range" id="set-det-thresh" min="0.1" max="0.95" step="0.05" value="0.45" />
+                <input type="number" id="set-det-thresh-num" min="0.1" max="0.95" step="0.05" value="0.45" class="settings-num" />
+              </div>
+            </div>
+            <div class="settings-row">
+              <label>Min face size <span class="settings-hint">pixels — ignore smaller faces</span></label>
+              <input type="number" id="set-min-face" min="10" max="200" step="5" value="30" class="settings-num-wide" />
+            </div>
+            <div class="settings-row">
+              <label>Tracking cooldown <span class="settings-hint">seconds between logs for same person</span></label>
+              <input type="number" id="set-track-cooldown" min="1" max="300" step="1" value="30" class="settings-num-wide" />
+            </div>
+            <div class="settings-row">
+              <label>Tracking max distance <span class="settings-hint">pixels — same unknown across frames</span></label>
+              <input type="number" id="set-track-dist" min="20" max="300" step="10" value="80" class="settings-num-wide" />
+            </div>
+            <div class="settings-form-footer">
+              <span class="settings-live-badge">⚡ Threshold &amp; tracking apply instantly</span>
+              <button type="submit" class="btn btn-primary btn-sm">Save</button>
+            </div>
+            <div class="settings-feedback hidden" id="settings-feedback-recognition"></div>
+          </form>
+        </div>
+
+        <!-- ② Alarm & Alerts -->
+        <div class="settings-card">
+          <div class="settings-card-title">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
+            Alarm &amp; Alerts
+          </div>
+          <form class="settings-form" id="settings-form-alarm">
+            <div class="settings-row settings-row-inline">
+              <label>Alarm enabled</label>
+              <label class="settings-toggle">
+                <input type="checkbox" id="set-alarm-enabled" />
+                <span class="settings-toggle-slider"></span>
+              </label>
+            </div>
+            <div class="settings-row settings-row-inline">
+              <label>Unknown person alert</label>
+              <label class="settings-toggle">
+                <input type="checkbox" id="set-alert-unknown" checked />
+                <span class="settings-toggle-slider"></span>
+              </label>
+            </div>
+            <div class="settings-row">
+              <label>Alarm cooldown <span class="settings-hint">seconds between repeated alarms</span></label>
+              <input type="number" id="set-alarm-cooldown" min="5" max="600" step="5" value="30" class="settings-num-wide" />
+            </div>
+            <div class="settings-row">
+              <label>Sound</label>
+              <select id="set-alarm-sound" class="settings-select">
+                <option value="beep">Beep</option>
+                <option value="voice" selected>Voice (TTS)</option>
+              </select>
+            </div>
+            <div class="settings-row">
+              <label>Output</label>
+              <select id="set-alarm-output" class="settings-select">
+                <option value="local" selected>Local speakers only</option>
+                <option value="camera">Camera speaker only</option>
+                <option value="both">Both (local + camera)</option>
+                <option value="sdk">SDK (HCNetSDK)</option>
+              </select>
+            </div>
+            <div class="settings-row">
+              <label>Voice text <span class="settings-hint">spoken when alarm triggers</span></label>
+              <input type="text" id="set-alarm-voice-text" value="Intruder alert!" class="settings-text" />
+            </div>
+            <div class="settings-row">
+              <label>Webhook URL <span class="settings-hint">POST on unknown detection (leave blank to disable)</span></label>
+              <input type="url" id="set-webhook-url" placeholder="https://hooks.slack.com/…" class="settings-text" />
+            </div>
+            <div class="settings-form-footer">
+              <span class="settings-live-badge">⚡ Applies instantly</span>
+              <button type="submit" class="btn btn-primary btn-sm">Save</button>
+            </div>
+            <div class="settings-feedback hidden" id="settings-feedback-alarm"></div>
+          </form>
+        </div>
+
+        <!-- ③ Camera Defaults -->
+        <div class="settings-card">
+          <div class="settings-card-title">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 3 8 3M12 3v4"/></svg>
+            Camera Defaults
+          </div>
+          <form class="settings-form" id="settings-form-camera">
+            <div class="settings-row">
+              <label>RTSP transport <span class="settings-hint">UDP = low latency (LAN) · TCP = stable (WiFi)</span></label>
+              <select id="set-cam-transport" class="settings-select">
+                <option value="udp" selected>UDP — low latency</option>
+                <option value="tcp">TCP — reliable</option>
+              </select>
+            </div>
+            <div class="settings-row">
+              <label>Frame skip <span class="settings-hint">process every Nth frame (1 = every frame)</span></label>
+              <input type="number" id="set-frame-skip" min="1" max="10" step="1" value="1" class="settings-num-wide" />
+            </div>
+            <div class="settings-row">
+              <label>Batch size <span class="settings-hint">frames per detection batch</span></label>
+              <input type="number" id="set-batch-size" min="1" max="16" step="1" value="8" class="settings-num-wide" />
+            </div>
+            <p class="settings-restart-note">⚠ Changes take effect after system restart.<br>Per-camera resolution: use the ⚙ button on each camera tile.</p>
+            <div class="settings-form-footer">
+              <button type="submit" class="btn btn-primary btn-sm">Save</button>
+            </div>
+            <div class="settings-feedback hidden" id="settings-feedback-camera"></div>
+          </form>
+        </div>
+
+        <!-- ④ System -->
+        <div class="settings-card">
+          <div class="settings-card-title">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+            System
+          </div>
+          <form class="settings-form" id="settings-form-system">
+            <div class="settings-row">
+              <label>Log level</label>
+              <select id="set-log-level" class="settings-select">
+                <option value="DEBUG">DEBUG</option>
+                <option value="INFO" selected>INFO</option>
+                <option value="WARNING">WARNING</option>
+                <option value="ERROR">ERROR</option>
+              </select>
+            </div>
+            <div class="settings-row settings-row-inline">
+              <label>Save unknown face crops <span class="settings-hint">logs/frames/</span></label>
+              <label class="settings-toggle">
+                <input type="checkbox" id="set-log-unknown-frames" />
+                <span class="settings-toggle-slider"></span>
+              </label>
+            </div>
+            <div class="settings-row">
+              <label>Attendance confidence <span class="settings-hint">min confidence to mark attendance</span></label>
+              <div class="settings-range-row">
+                <input type="range" id="set-att-confidence" min="0.1" max="0.99" step="0.05" value="0.45" />
+                <input type="number" id="set-att-confidence-num" min="0.1" max="0.99" step="0.05" value="0.45" class="settings-num" />
+              </div>
+            </div>
+            <div class="settings-row">
+              <label>Shift start <span class="settings-hint">used for late detection (HH:MM)</span></label>
+              <input type="time" id="set-shift-start" class="settings-num-wide" />
+            </div>
+            <div class="settings-row">
+              <label>Shift end</label>
+              <input type="time" id="set-shift-end" class="settings-num-wide" />
+            </div>
+            <p class="settings-restart-note">⚠ Log level &amp; attendance changes take effect after restart.</p>
+            <div class="settings-form-footer">
+              <button type="submit" class="btn btn-primary btn-sm">Save</button>
+            </div>
+            <div class="settings-feedback hidden" id="settings-feedback-system"></div>
+          </form>
+        </div>
+
       </div>
     </div>
 
@@ -310,6 +495,42 @@
       </div>
       <div id="add-camera-feedback" class="form-feedback hidden"></div>
       <button type="submit" class="btn btn-primary">Add Camera</button>
+    </form>
+  </div>
+</div>
+
+<!-- ── Camera Settings Modal ──────────────────────────────── -->
+<div id="cam-settings-overlay" class="modal-overlay hidden">
+  <div class="modal" style="max-width:400px">
+    <button class="modal-close" id="close-cam-settings">✕</button>
+    <h2>Camera Settings</h2>
+    <div id="cam-settings-cam-name" style="color:var(--text-muted);font-size:0.82rem;margin-bottom:16px"></div>
+    <form id="cam-settings-form">
+      <input type="hidden" id="cam-settings-id" />
+      <div class="form-group">
+        <label>Resolution</label>
+        <select id="cam-settings-preset" class="att-select" style="width:100%">
+          <option value="480">480p — 854 × 480</option>
+          <option value="720" selected>720p — 1280 × 720</option>
+          <option value="1080">1080p — 1920 × 1080</option>
+          <option value="custom">Custom…</option>
+        </select>
+      </div>
+      <div id="cam-settings-custom-row" class="hidden" style="display:flex;gap:10px">
+        <div class="form-group" style="flex:1">
+          <label>Width (px)</label>
+          <input type="number" id="cam-settings-w" min="160" max="3840" value="1280" />
+        </div>
+        <div class="form-group" style="flex:1">
+          <label>Height (px)</label>
+          <input type="number" id="cam-settings-h" min="120" max="2160" value="720" />
+        </div>
+      </div>
+      <div id="cam-settings-feedback" class="form-feedback hidden"></div>
+      <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:4px">
+        <button type="button" class="btn" id="cancel-cam-settings" style="background:var(--surface2)">Cancel</button>
+        <button type="submit" class="btn btn-primary">Apply</button>
+      </div>
     </form>
   </div>
 </div>
