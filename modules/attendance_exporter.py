@@ -318,17 +318,35 @@ class AttendanceExporter:
         records  = self._db.get_attendance_by_date(today)
         csv_bytes = build_csv_bytes(records)
 
-        # Save CSV
+        # Save CSV to reports/
         csv_path = self._reports_dir / f"attendance_{today}.csv"
         csv_path.write_bytes(csv_bytes)
 
-        # Save Excel
+        # Save Excel to reports/
         xl_bytes: Optional[bytes] = None
+        xl_name = f"attendance_{today}.xlsx"
         try:
             xl_bytes = build_excel_bytes(records)
-            (self._reports_dir / f"attendance_{today}.xlsx").write_bytes(xl_bytes)
+            (self._reports_dir / xl_name).write_bytes(xl_bytes)
         except Exception:
             logger.exception("Excel export failed during daily run")
+
+        # Also copy both files to the Desktop for easy access
+        desktop = Path.home() / "Desktop"
+        try:
+            desktop_csv = desktop / f"attendance_{today}.csv"
+            desktop_csv.write_bytes(csv_bytes)
+            logger.info("Attendance CSV saved to Desktop: %s", desktop_csv)
+        except Exception:
+            logger.warning("Could not save CSV to Desktop")
+
+        if xl_bytes is not None:
+            try:
+                desktop_xl = desktop / xl_name
+                desktop_xl.write_bytes(xl_bytes)
+                logger.info("Attendance Excel saved to Desktop: %s", desktop_xl)
+            except Exception:
+                logger.warning("Could not save Excel to Desktop")
 
         logger.info("Daily export done: %d records for %s", len(records), today)
 

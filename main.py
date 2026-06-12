@@ -48,6 +48,11 @@ from modules.logging_service import LoggingService
 from modules.api_server import create_app
 from modules.attendance_exporter import AttendanceExporter
 from modules.email_service import EmailService
+from modules.door_controller import DoorController
+from modules.greeting_service import GreetingService
+from modules.alarm_service import AlarmService
+from modules.hikvision_sdk import HikvisionSDK
+from modules.sdk_event_listener import SDKEventListener
 
 
 # ─────────────────────────────────────────────────────────────
@@ -104,6 +109,8 @@ class RecognitionPipeline:
         tracker: FaceTracker,
         logging_svc: LoggingService,
         db: EmployeeDatabase,
+        door_controller: Optional["DoorController"] = None,
+        greeting_service: Optional["GreetingService"] = None,
     ) -> None:
         self.cfg = cfg
         self.camera_manager = camera_manager
@@ -112,6 +119,8 @@ class RecognitionPipeline:
         self.tracker = tracker
         self.logging_svc = logging_svc
         self.db = db
+        self.door_controller = door_controller
+        self.greeting_service = greeting_service
 
         perf = cfg.get("performance", {})
         self.display = cfg.get("performance", {}).get("display_results", True)
@@ -125,18 +134,30 @@ class RecognitionPipeline:
 
         self._running = False
         self._pool: Optional[ThreadPoolExecutor] = None
+        self._cam_threads: Dict[str, threading.Thread] = {}
         self._windows: dict = {}
 
     def start(self) -> None:
         self._running = True
         self._pool = ThreadPoolExecutor(
-            max_workers=self.num_threads,
+            max_workers=max(self.num_threads, 16),
             thread_name_prefix="recognizer",
         )
-        # One processing thread per camera
         for cam_id in self.camera_manager.camera_ids:
-            self._pool.submit(self._process_camera, cam_id)
-        logger.info("Recognition pipeline started (threads={})", self.num_threads)
+            self._start_camera_thread(cam_id)
+        logger.info("Recognition pipeline started (cameras={})", len(self._cam_threads))
+
+    def add_camera(self, cam_id: str) -> None:
+        """Start a recognition thread for a camera added at runtime."""
+        if self._running and cam_id not in self._cam_threads:
+            self._start_camera_thread(cam_id)
+            logger.info("Recognition thread added for camera: {}", cam_id)
+
+    def _start_camera_thread(self, cam_id: str) -> None:
+        if self._pool is None:
+            return
+        future = self._pool.submit(self._process_camera, cam_id)
+        self._cam_threads[cam_id] = future  # type: ignore[assignment]
 
     def stop(self) -> None:
         self._running = False
@@ -156,7 +177,9 @@ class RecognitionPipeline:
 
         logger.info("Processing loop started for camera: {}", cam_id)
         while self._running:
-            frame_obj = cam.read(timeout=0.15)
+            # read_latest() always returns the newest frame, so slow
+            # processing never causes the pipeline to fall further behind.
+            frame_obj = cam.read_latest(timeout=0.15)
             if frame_obj is None:
                 continue
 
@@ -217,6 +240,21 @@ class RecognitionPipeline:
                         )
                 except Exception as exc:
                     logger.warning("Attendance mark failed for {}: {}", result.employee_id, exc)
+
+            # ── Door unlock + voice greeting ─────────────────
+            if result.is_known:
+                if self.door_controller:
+                    self.door_controller.trigger(
+                        employee_id=result.employee_id,
+                        employee_name=result.name,
+                        camera_id=cam_id,
+                        confidence=result.confidence,
+                    )
+                if self.greeting_service:
+                    self.greeting_service.greet(
+                        employee_id=result.employee_id,
+                        employee_name=result.name,
+                    )
 
             # ── Build annotation label ───────────────────────
             if result.is_known:
@@ -350,7 +388,15 @@ def main(config_path: str, no_display: bool = False, camera_source=None) -> None
                 motion_threshold=cam.get("motion_threshold", 500),
                 motion_only=cam.get("motion_only", False),
                 resize_width=cam.get("resize_width", 0),
+                resize_height=cam.get("resize_height", 0),
+                rtsp_transport=cam.get("rtsp_transport", "udp"),
             )
+
+    # ── Hikvision SDK ─────────────────────────────────────────
+    sdk = HikvisionSDK(cfg)
+    sdk_ready = sdk.load() and sdk.initialize() and sdk.login()
+    if not sdk_ready:
+        logger.info("HikvisionSDK not active — using ISAPI / HTTP fallback")
 
     # ── Logging service ───────────────────────────────────────
     log_cfg = cfg.get("logging", {})
@@ -364,6 +410,11 @@ def main(config_path: str, no_display: bool = False, camera_source=None) -> None
     )
     logging_svc.start()
 
+    # ── Alarm service (unknown person alert) ──────────────────
+    alarm_svc = AlarmService(cfg, sdk=sdk)
+    alarm_svc.start()
+    logging_svc.subscribe(alarm_svc.on_detection_event)
+
     # ── Attendance exporter (daily CSV + Excel at 11:59 PM) ───
     att_cfg    = cfg.get("attendance", {})
     email_svc  = EmailService(cfg)
@@ -373,6 +424,31 @@ def main(config_path: str, no_display: bool = False, camera_source=None) -> None
         email_service=email_svc,
     )
     exporter.start()
+
+    # ── Greeting service (TTS) ────────────────────────────────
+    greeting_svc = GreetingService(cfg, sdk=sdk)
+    greeting_svc.start()
+
+    # ── Door controller ───────────────────────────────────────
+    door_controller = DoorController(cfg, sdk=sdk)
+    door_controller.initialize()
+
+    # ── SDK event listener (motion / intrusion / line-crossing) ──
+    sdk_events = SDKEventListener(sdk, camera_id="frontcam1")
+    sdk_events.start()
+
+    # ── Recognition pipeline ──────────────────────────────────
+    pipeline = RecognitionPipeline(
+        cfg=cfg,
+        camera_manager=camera_manager,
+        detector=detector,
+        recognizer=recognizer,
+        tracker=tracker,
+        logging_svc=logging_svc,
+        db=db,
+        door_controller=door_controller,
+        greeting_service=greeting_svc,
+    )
 
     # ── API server ────────────────────────────────────────────
     api_cfg = cfg.get("api", {})
@@ -384,17 +460,10 @@ def main(config_path: str, no_display: bool = False, camera_source=None) -> None
         face_detector=detector,
         config=cfg,
         attendance_exporter=exporter,
-    )
-
-    # ── Recognition pipeline ──────────────────────────────────
-    pipeline = RecognitionPipeline(
-        cfg=cfg,
-        camera_manager=camera_manager,
-        detector=detector,
-        recognizer=recognizer,
+        door_controller=door_controller,
+        pipeline=pipeline,
         tracker=tracker,
-        logging_svc=logging_svc,
-        db=db,
+        alarm_svc=alarm_svc,
     )
 
     # ── Graceful shutdown ─────────────────────────────────────
@@ -404,6 +473,11 @@ def main(config_path: str, no_display: bool = False, camera_source=None) -> None
         camera_manager.stop_all()
         logging_svc.stop()
         exporter.stop()
+        door_controller.cleanup()
+        greeting_svc.stop()
+        alarm_svc.stop()
+        sdk_events.stop()
+        sdk.cleanup()
         sys.exit(0)
 
     signal.signal(signal.SIGINT,  _shutdown)

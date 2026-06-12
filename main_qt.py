@@ -35,6 +35,7 @@ from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
+import uvicorn
 import yaml
 from dotenv import load_dotenv
 
@@ -53,6 +54,7 @@ from PyQt6.QtWidgets import (
     QSplitter, QSizePolicy, QToolButton,
     QDialogButtonBox, QStatusBar,
     QTableWidget, QTableWidgetItem, QHeaderView, QDateEdit,
+    QTabWidget, QCheckBox, QSpinBox, QDoubleSpinBox, QComboBox,
 )
 from PyQt6.QtCore import QDate
 
@@ -61,7 +63,10 @@ load_dotenv()
 from modules.employee_database import EmployeeDatabase
 from modules.face_detector import FaceDetector
 from modules.face_recognizer import FaceRecognizer, FaceTracker
-from modules.camera_stream import CameraStream
+from modules.camera_stream import CameraStream, Frame
+from modules.attendance_exporter import AttendanceExporter
+from modules.greeting_service import GreetingService
+from modules.logging_service import LoggingService
 
 logger = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).resolve().parent
@@ -150,6 +155,181 @@ def styled_btn(text: str, color: str = C_ACCENT,
 
 
 # ─────────────────────────────────────────────────────────────
+# Entry-based greeting tracker
+# Greets an employee the moment they appear in frame (or
+# re-appear after being absent for absence_seconds).
+# Completely independent of FaceTracker / logging cooldown.
+# ─────────────────────────────────────────────────────────────
+
+class _EntryGreetTracker:
+    """Returns True the first time an employee is seen, and again after
+    they have been absent from the frame for at least absence_seconds."""
+
+    def __init__(self, absence_seconds: float = 5.0) -> None:
+        self._absence = absence_seconds
+        self._last_seen: Dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def on_seen(self, employee_id: str) -> bool:
+        now = time.time()
+        with self._lock:
+            last = self._last_seen.get(employee_id, 0.0)
+            self._last_seen[employee_id] = now
+            return (now - last) > self._absence
+
+
+# ─────────────────────────────────────────────────────────────
+# Web-server bridge
+# Shares annotated frames + detection events with the FastAPI
+# server so the browser dashboard reads from the same pipeline
+# as the Qt window — no second camera connection needed.
+# ─────────────────────────────────────────────────────────────
+
+class _FrameHub:
+    """Thread-safe latest-frame store, one slot per camera."""
+
+    def __init__(self) -> None:
+        self._frames: Dict[str, np.ndarray] = {}
+        self._lock   = threading.Lock()
+
+    def push(self, cam_id: str, frame: np.ndarray) -> None:
+        with self._lock:
+            self._frames[cam_id] = frame.copy()
+
+    def get(self, cam_id: str) -> Optional[np.ndarray]:
+        with self._lock:
+            return self._frames.get(cam_id)
+
+
+class _QtCameraProxy:
+    """Fake CameraStream backed by _FrameHub for the web server."""
+
+    def __init__(self, cam_id: str, hub: _FrameHub, fps: int = 25,
+                 resize_width: int = 0, resize_height: int = 0) -> None:
+        self.camera_id     = cam_id
+        self._hub          = hub
+        self.fps           = fps
+        self.target_fps    = fps
+        self.resize_width  = resize_width
+        self.resize_height = resize_height
+        self._count        = 0
+
+    def read(self, timeout: float = 0.1) -> Optional[Frame]:
+        frame = self._hub.get(self.camera_id)
+        if frame is None:
+            return None
+        self._count += 1
+        return Frame(
+            camera_id=self.camera_id,
+            frame=frame,
+            frame_number=self._count,
+            timestamp=time.time(),
+        )
+
+    def get_stats(self) -> Dict:
+        return {
+            "camera_id":    self.camera_id,
+            "connected":    self._hub.get(self.camera_id) is not None,
+            "fps":          self.fps,
+            "target_fps":   self.target_fps,
+            "resize_width": self.resize_width,
+            "resize_height": self.resize_height,
+        }
+
+
+class _QtCameraManager:
+    """Fake MultiCameraManager backed by _FrameHub."""
+
+    def __init__(self) -> None:
+        self._cams: Dict[str, _QtCameraProxy] = {}
+
+    def register(self, cam_id: str, hub: _FrameHub, fps: int = 25,
+                 resize_width: int = 0, resize_height: int = 0) -> None:
+        self._cams[cam_id] = _QtCameraProxy(cam_id, hub, fps, resize_width, resize_height)
+
+    def get_camera(self, cam_id: str) -> Optional[_QtCameraProxy]:
+        return self._cams.get(cam_id)
+
+    def get_all_stats(self) -> Dict:
+        return {k: v.get_stats() for k, v in self._cams.items()}
+
+    @property
+    def camera_ids(self) -> List[str]:
+        return list(self._cams.keys())
+
+    def __len__(self) -> int:
+        return len(self._cams)
+
+    def add_camera(self, *args, **kwargs):
+        raise ValueError("Adding cameras at runtime is not supported in desktop mode.")
+
+    def remove_camera(self, cam_id: str) -> bool:
+        return self._cams.pop(cam_id, None) is not None
+
+
+def _start_web_server(
+    cfg: Dict,
+    db: "EmployeeDatabase",
+    qt_cam_mgr: _QtCameraManager,
+    logging_svc: "LoggingService",
+    recognizer: "FaceRecognizer",
+    detector: "FaceDetector",
+) -> threading.Thread:
+    """Start the FastAPI dashboard in a daemon thread, sharing the Qt pipeline."""
+
+    def _run() -> None:
+        import asyncio
+        try:
+            from modules.api_server import create_app
+
+            alarm_svc = None
+            try:
+                from modules.alarm_service import AlarmService
+                alarm_svc = AlarmService(cfg)
+                alarm_svc.start()
+                logging_svc.subscribe(alarm_svc.on_detection_event)
+            except Exception:
+                pass
+
+            fastapi_app = create_app(
+                db=db,
+                recognizer=recognizer,
+                camera_manager=qt_cam_mgr,
+                logging_svc=logging_svc,
+                face_detector=detector,
+                config=cfg,
+                attendance_exporter=None,
+                door_controller=None,
+                pipeline=None,
+                tracker=None,
+                alarm_svc=alarm_svc,
+            )
+
+            api_cfg = cfg.get("api", {})
+            port    = int(api_cfg.get("port", 8000))
+            host    = api_cfg.get("host", "0.0.0.0")
+
+            server = uvicorn.Server(uvicorn.Config(
+                app=fastapi_app,
+                host=host,
+                port=port,
+                log_level="warning",
+                access_log=False,
+            ))
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(server.serve())
+
+        except Exception as exc:
+            import traceback
+            print(f"[web-server] failed to start:\n{traceback.format_exc()}")
+
+    t = threading.Thread(target=_run, daemon=True, name="frs-web")
+    t.start()
+    return t
+
+
+# ─────────────────────────────────────────────────────────────
 # Camera + Recognition background worker (QThread)
 # ─────────────────────────────────────────────────────────────
 
@@ -171,11 +351,18 @@ class CameraWorker(QThread):
     status      = pyqtSignal(str)
     fps_update  = pyqtSignal(float)
 
-    def __init__(self, cfg: Dict, db: EmployeeDatabase) -> None:
+    def __init__(self, cfg: Dict, db: EmployeeDatabase,
+                 frame_hub: Optional[_FrameHub] = None,
+                 logging_svc: Optional[LoggingService] = None,
+                 greeting_svc: Optional[GreetingService] = None) -> None:
         super().__init__()
-        self.cfg = cfg
-        self.db  = db
-        self._running = False
+        self.cfg           = cfg
+        self.db            = db
+        self._frame_hub    = frame_hub
+        self._logging_svc  = logging_svc
+        self._greeting_svc = greeting_svc
+        self._entry_greet  = _EntryGreetTracker(absence_seconds=300.0)
+        self._running    = False
         self._frame_lock = threading.Lock()
         self._latest_raw: Optional[np.ndarray] = None
         self._latest_annotated: Optional[np.ndarray] = None
@@ -348,20 +535,52 @@ class CameraWorker(QThread):
                     result = self.recognizer.recognize(face.embedding)
                     result.bbox = face.bbox
 
+                    # Voice greeting — fires on fresh entry, independent of logging cooldown.
+                    # Use result.name as the tracker key — employee_id can fall back to
+                    # the shared sentinel "UNKNOWN" when the DB field is missing, which
+                    # would cause all employees to share one cooldown slot.
+                    logger.debug(
+                        "[GREET-CHECK] name=%s is_known=%s conf=%.2f",
+                        result.name, result.is_known, result.confidence,
+                    )
+                    if result.is_known and self._greeting_svc is not None:
+                        _greet_key = result.name or result.employee_id
+                        if self._entry_greet.on_seen(_greet_key):
+                            logger.info("[GREET] Firing greeting for: %s", result.name)
+                            try:
+                                self._greeting_svc.greet(
+                                    employee_id   = _greet_key,
+                                    employee_name = result.name,
+                                )
+                            except Exception:
+                                pass
+
                     cx, cy = face.center
                     if self.tracker.should_log(result, (cx, cy)):
-                        # Persist to DB directly (no async needed here)
+                        # Log via LoggingService (→ DB + WebSocket broadcast)
+                        # or fall back to direct DB write if no service is wired up.
                         try:
-                            self.db.log_detection(
-                                camera_id     = self._cam_id,
-                                employee_id   = result.employee_id if result.is_known else None,
-                                employee_name = result.name,
-                                confidence    = result.confidence,
-                                is_known      = result.is_known,
-                                bbox          = list(face.bbox),
-                            )
+                            if self._logging_svc is not None:
+                                self._logging_svc.log_detection(
+                                    camera_id     = self._cam_id,
+                                    employee_id   = result.employee_id if result.is_known else None,
+                                    employee_name = result.name,
+                                    confidence    = result.confidence,
+                                    is_known      = result.is_known,
+                                    bbox          = list(face.bbox),
+                                    frame         = annotated if not result.is_known else None,
+                                )
+                            else:
+                                self.db.log_detection(
+                                    camera_id     = self._cam_id,
+                                    employee_id   = result.employee_id if result.is_known else None,
+                                    employee_name = result.name,
+                                    confidence    = result.confidence,
+                                    is_known      = result.is_known,
+                                    bbox          = list(face.bbox),
+                                )
                         except Exception:
-                            pass  # never crash the recognition loop
+                            pass
 
                         # Mark attendance when confidence is high enough
                         if result.is_known and result.confidence >= self._attendance_threshold:
@@ -402,6 +621,10 @@ class CameraWorker(QThread):
 
             with self._frame_lock:
                 self._latest_annotated = annotated
+
+            # Push annotated frame to web bridge (non-blocking)
+            if self._frame_hub is not None and self._cam_id is not None:
+                self._frame_hub.push(self._cam_id, annotated)
 
             # FPS counter
             fps_count += 1
@@ -724,6 +947,279 @@ class LogPanel(QWidget):
             if item and item.widget():
                 item.widget().deleteLater()
             self._entry_count -= 1
+
+
+# ─────────────────────────────────────────────────────────────
+# Unknown Persons Panel
+# Displays auto-saved captures of unrecognised faces.
+# ─────────────────────────────────────────────────────────────
+
+class _CaptureCard(QFrame):
+    delete_requested = pyqtSignal(str)   # emits file path
+
+    def __init__(self, fpath: Path, pixmap: "QPixmap", parent=None) -> None:
+        super().__init__(parent)
+        self._fpath = fpath
+        self.setFixedWidth(190)
+        self.setStyleSheet(f"""
+            QFrame {{ background: {C_CARD}; border-radius: 8px;
+                      border: 1px solid {C_BORDER}; }}
+        """)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(6, 6, 6, 6)
+        lay.setSpacing(4)
+
+        # Thumbnail — pixmap is pre-loaded and cached by the panel
+        img_lbl = QLabel()
+        img_lbl.setFixedSize(178, 134)
+        img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        img_lbl.setStyleSheet("border: none;")
+        img_lbl.setPixmap(pixmap)
+        lay.addWidget(img_lbl)
+
+        # Timestamp
+        ts_lbl = QLabel(self._parse_ts(fpath.name))
+        ts_lbl.setStyleSheet(f"color: {C_MUTED}; font-size: 9px; border: none;")
+        ts_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        ts_lbl.setWordWrap(True)
+        lay.addWidget(ts_lbl)
+
+        # Camera label
+        cam_lbl = QLabel(self._parse_cam(fpath.name))
+        cam_lbl.setStyleSheet(f"color: {C_ACCENT}; font-size: 9px; border: none;")
+        cam_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(cam_lbl)
+
+        # Delete button
+        del_btn = QPushButton("Delete")
+        del_btn.setFixedHeight(22)
+        del_btn.setStyleSheet(f"""
+            QPushButton {{ background: {C_RED}; color: white;
+                           border: none; border-radius: 4px; font-size: 10px; }}
+            QPushButton:hover {{ background: #ef4444; }}
+        """)
+        del_btn.clicked.connect(lambda: self.delete_requested.emit(str(self._fpath)))
+        lay.addWidget(del_btn)
+
+    @staticmethod
+    def _parse_ts(name: str) -> str:
+        # Expected: {cam}_{emp_id}_{YYYYMMDD}_{HHMMSS}_{us}.jpg
+        parts = name.replace(".jpg", "").split("_")
+        for i, p in enumerate(parts):
+            if len(p) == 8 and p.isdigit():
+                try:
+                    d = f"{p[:4]}-{p[4:6]}-{p[6:]}"
+                    t = parts[i + 1]
+                    return f"{d}  {t[:2]}:{t[2:4]}:{t[4:]}"
+                except Exception:
+                    pass
+        return name
+
+    @staticmethod
+    def _parse_cam(name: str) -> str:
+        parts = name.split("_")
+        # cam prefix is usually "cam" followed by more parts
+        cam_parts = []
+        for p in parts:
+            if len(p) == 8 and p.isdigit():
+                break
+            cam_parts.append(p)
+        return "_".join(cam_parts) if cam_parts else ""
+
+
+class UnknownPersonsPanel(QWidget):
+    """Scrollable grid of captured unknown-person images from logs/frames/."""
+
+    COLS = 4
+    _THUMB_W = 178
+    _THUMB_H = 134
+
+    def __init__(self, frames_dir: str = "logs/frames", parent=None) -> None:
+        super().__init__(parent)
+        self._frames_dir = Path(frames_dir)
+        self._shown: set = set()
+        self._cards: Dict[str, _CaptureCard] = {}
+        # Scaled pixmap cache — avoids re-reading from disk on every rebuild.
+        # Key is the absolute path string; value is the already-scaled QPixmap.
+        self._pm_cache: Dict[str, QPixmap] = {}
+        # Debounce timer — coalesces rapid refresh() calls into one execution.
+        self._debounce = QTimer(self)
+        self._debounce.setSingleShot(True)
+        self._debounce.setInterval(700)
+        self._debounce.timeout.connect(self._do_refresh)
+        self._build_ui()
+
+    # ── UI ───────────────────────────────────────────────────
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+
+        # Header row
+        hdr = QHBoxLayout()
+        ttl = QLabel("Unknown Person Captures")
+        ttl.setStyleSheet(
+            f"color: {C_TEXT}; font-size: 15px; font-weight: 700;")
+        self._count_lbl = QLabel("0 captures")
+        self._count_lbl.setStyleSheet(
+            f"color: {C_MUTED}; font-size: 11px;")
+
+        open_btn = QPushButton("Open Folder")
+        open_btn.setFixedHeight(28)
+        open_btn.setStyleSheet(f"""
+            QPushButton {{ background: {C_CARD}; color: {C_TEXT};
+                           border: 1px solid {C_BORDER}; border-radius: 5px;
+                           padding: 0 10px; font-size: 11px; }}
+            QPushButton:hover {{ background: {C_BORDER}; }}
+        """)
+        open_btn.clicked.connect(self._open_folder)
+
+        clear_btn = QPushButton("Clear All")
+        clear_btn.setFixedHeight(28)
+        clear_btn.setStyleSheet(f"""
+            QPushButton {{ background: {C_RED}; color: white;
+                           border: none; border-radius: 5px;
+                           padding: 0 10px; font-size: 11px; }}
+            QPushButton:hover {{ background: #ef4444; }}
+        """)
+        clear_btn.clicked.connect(self._clear_all)
+
+        hdr.addWidget(ttl)
+        hdr.addWidget(self._count_lbl)
+        hdr.addStretch()
+        hdr.addWidget(open_btn)
+        hdr.addWidget(clear_btn)
+        root.addLayout(hdr)
+
+        # Scroll area → grid container
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("background: transparent; border: none;")
+
+        self._container = QWidget()
+        self._container.setStyleSheet("background: transparent;")
+        self._grid = QGridLayout(self._container)
+        self._grid.setSpacing(10)
+        self._grid.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+
+        scroll.setWidget(self._container)
+        root.addWidget(scroll, stretch=1)
+
+    # ── Public ───────────────────────────────────────────────
+
+    def refresh(self) -> None:
+        """Schedule a refresh — rapid back-to-back calls are coalesced."""
+        self._debounce.start()   # restarts the 700 ms window each time
+
+    def showEvent(self, event) -> None:
+        """Refresh immediately whenever the tab becomes visible."""
+        super().showEvent(event)
+        self._do_refresh()
+
+    # ── Internal ─────────────────────────────────────────────
+
+    def _do_refresh(self) -> None:
+        """Actual refresh — at most once per 700 ms via debounce."""
+        if not self._frames_dir.exists():
+            return
+
+        files = sorted(
+            self._frames_dir.glob("*.jpg"),
+            key=lambda f: f.stat().st_mtime,
+            reverse=True,
+        )
+
+        new_files = [f for f in files if f.name not in self._shown]
+        if not new_files:
+            return
+
+        # Load scaled pixmaps only for files not yet in the cache.
+        # Existing entries are reused — no disk I/O.
+        for fpath in new_files:
+            key = str(fpath)
+            if key not in self._pm_cache:
+                pm = QPixmap(str(fpath))
+                if not pm.isNull():
+                    pm = pm.scaled(
+                        self._THUMB_W, self._THUMB_H,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                self._pm_cache[key] = pm
+
+        self._rebuild_grid(files)
+
+    def _rebuild_grid(self, files: list) -> None:
+        """Rebuild grid layout using cached pixmaps — no disk I/O."""
+        while self._grid.count():
+            item = self._grid.takeAt(0)
+            if item and item.widget():
+                item.widget().deleteLater()
+        self._shown.clear()
+        self._cards.clear()
+
+        for idx, fpath in enumerate(files):
+            pm = self._pm_cache.get(str(fpath), QPixmap())
+            card = _CaptureCard(fpath, pm)
+            card.delete_requested.connect(self._delete_card)
+            row, col = divmod(idx, self.COLS)
+            self._grid.addWidget(card, row, col)
+            self._shown.add(fpath.name)
+            self._cards[fpath.name] = card
+
+        n = len(files)
+        self._count_lbl.setText(f"{n} capture{'s' if n != 1 else ''}")
+
+    def _delete_card(self, fpath_str: str) -> None:
+        fpath = Path(fpath_str)
+        try:
+            fpath.unlink(missing_ok=True)
+        except Exception:
+            pass
+        name = fpath.name
+        card = self._cards.pop(name, None)
+        if card:
+            card.deleteLater()
+        self._shown.discard(name)
+        self._pm_cache.pop(str(fpath), None)
+        # Reflow remaining cards — all pixmaps are cached so this is instant
+        remaining = sorted(
+            [self._frames_dir / n for n in self._shown
+             if (self._frames_dir / n).exists()],
+            key=lambda f: f.stat().st_mtime,
+            reverse=True,
+        )
+        self._rebuild_grid(remaining)
+
+    def _clear_all(self) -> None:
+        reply = QMessageBox.question(
+            self, "Clear All",
+            "Delete all unknown person captures?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        for f in self._frames_dir.glob("*.jpg"):
+            try:
+                f.unlink()
+            except Exception:
+                pass
+        while self._grid.count():
+            item = self._grid.takeAt(0)
+            if item and item.widget():
+                item.widget().deleteLater()
+        self._shown.clear()
+        self._cards.clear()
+        self._count_lbl.setText("0 captures")
+
+    def _open_folder(self) -> None:
+        self._frames_dir.mkdir(parents=True, exist_ok=True)
+        import subprocess
+        subprocess.Popen(["explorer", str(self._frames_dir)])
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1337,6 +1833,566 @@ class AddCameraDialog(QDialog):
 
 
 # ─────────────────────────────────────────────────────────────
+# Camera Manager Dialog  (list + rename + remove + add)
+# ─────────────────────────────────────────────────────────────
+
+class CameraManagerDialog(QDialog):
+    """Lists all configured cameras; allows rename, remove, and add."""
+
+    def __init__(self, cfg: Dict, parent=None) -> None:
+        super().__init__(parent)
+        self._cfg = cfg
+        self.setWindowTitle("Camera Manager")
+        self.setModal(True)
+        self.setMinimumSize(640, 380)
+        self.setStyleSheet(f"""
+            QDialog   {{ background: {C_PANEL}; color: {C_TEXT};
+                          font-family: 'Segoe UI', sans-serif; }}
+            QLabel    {{ color: {C_TEXT}; font-size: 13px; }}
+            QLineEdit {{ background: {C_CARD}; color: {C_TEXT};
+                          border: 1px solid {C_BORDER}; border-radius: 5px;
+                          padding: 6px 10px; font-size: 12px; }}
+            QLineEdit:focus {{ border-color: {C_ACCENT}; }}
+            QTableWidget {{ background: {C_CARD}; color: {C_TEXT};
+                             border: 1px solid {C_BORDER}; border-radius: 6px;
+                             gridline-color: {C_BORDER}; font-size: 12px; }}
+            QHeaderView::section {{ background: {C_PANEL}; color: {C_MUTED};
+                                     font-size: 11px; font-weight: 600;
+                                     border: none; padding: 6px; }}
+            QTableWidget::item {{ padding: 4px 8px; }}
+            QTableWidget::item:selected {{ background: {C_ACCENT}; }}
+        """)
+        self._build_ui()
+        self._populate()
+
+    # ── UI ───────────────────────────────────────────────────
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 20, 20, 20)
+        root.setSpacing(14)
+
+        ttl = QLabel("Camera Manager")
+        ttl.setStyleSheet(
+            f"font-size: 17px; font-weight: 700; color: {C_TEXT};")
+        root.addWidget(ttl)
+
+        self._table = QTableWidget(0, 4)
+        self._table.setHorizontalHeaderLabels(["Name", "ID", "Source", "Actions"])
+        self._table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch)
+        self._table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.ResizeToContents)
+        self._table.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.Stretch)
+        self._table.horizontalHeader().setSectionResizeMode(
+            3, QHeaderView.ResizeMode.ResizeToContents)
+        self._table.verticalHeader().setVisible(False)
+        self._table.setEditTriggers(
+            QTableWidget.EditTrigger.NoEditTriggers)
+        self._table.setSelectionMode(
+            QTableWidget.SelectionMode.SingleSelection)
+        self._table.setAlternatingRowColors(False)
+        root.addWidget(self._table, stretch=1)
+
+        # Bottom row — add camera + close
+        bot = QHBoxLayout()
+        add_btn = styled_btn("+ Add Camera", C_ACCENT, C_ACCENT_H)
+        add_btn.clicked.connect(self._add_camera)
+        close_btn = styled_btn("Close", C_CARD, "#475569")
+        close_btn.clicked.connect(self.accept)
+        bot.addWidget(add_btn)
+        bot.addStretch()
+        bot.addWidget(close_btn)
+        root.addLayout(bot)
+
+    # ── Populate ─────────────────────────────────────────────
+
+    def _populate(self) -> None:
+        cameras = self._cfg.get("cameras", [])
+        self._table.setRowCount(len(cameras))
+        for row, cam in enumerate(cameras):
+            self._table.setItem(row, 0, QTableWidgetItem(cam.get("name", "")))
+            self._table.setItem(row, 1, QTableWidgetItem(cam.get("id",   "")))
+            self._table.setItem(row, 2, QTableWidgetItem(cam.get("source", "")))
+
+            # Action buttons cell
+            cell = QWidget()
+            cell_lay = QHBoxLayout(cell)
+            cell_lay.setContentsMargins(4, 2, 4, 2)
+            cell_lay.setSpacing(6)
+
+            rename_btn = QPushButton("Rename")
+            rename_btn.setFixedHeight(24)
+            rename_btn.setStyleSheet(f"""
+                QPushButton {{ background: {C_ACCENT}; color: white;
+                               border: none; border-radius: 4px;
+                               padding: 0 8px; font-size: 11px; }}
+                QPushButton:hover {{ background: {C_ACCENT_H}; }}
+            """)
+            rename_btn.clicked.connect(
+                lambda _, r=row: self._rename_camera(r))
+
+            remove_btn = QPushButton("Remove")
+            remove_btn.setFixedHeight(24)
+            remove_btn.setStyleSheet(f"""
+                QPushButton {{ background: {C_RED}; color: white;
+                               border: none; border-radius: 4px;
+                               padding: 0 8px; font-size: 11px; }}
+                QPushButton:hover {{ background: #ef4444; }}
+            """)
+            remove_btn.clicked.connect(
+                lambda _, r=row: self._remove_camera(r))
+
+            cell_lay.addWidget(rename_btn)
+            cell_lay.addWidget(remove_btn)
+            self._table.setCellWidget(row, 3, cell)
+
+        self._table.resizeRowsToContents()
+
+    # ── Actions ──────────────────────────────────────────────
+
+    def _rename_camera(self, row: int) -> None:
+        cameras = self._cfg.get("cameras", [])
+        if row >= len(cameras):
+            return
+        cam = cameras[row]
+        old_name = cam.get("name", "")
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Rename Camera")
+        dlg.setModal(True)
+        dlg.setMinimumWidth(360)
+        dlg.setStyleSheet(self.styleSheet())
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(20, 20, 20, 20)
+        lay.setSpacing(12)
+
+        lay.addWidget(QLabel(f"Camera:  <b>{cam.get('id','')}</b>"))
+        lbl = QLabel("New Name:")
+        lbl.setStyleSheet(f"color: {C_MUTED}; font-size: 12px;")
+        lay.addWidget(lbl)
+        edit = QLineEdit(old_name)
+        edit.selectAll()
+        lay.addWidget(edit)
+
+        status = QLabel("")
+        status.setStyleSheet(f"color: {C_AMBER}; font-size: 11px;")
+        lay.addWidget(status)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        cancel = styled_btn("Cancel", C_CARD, "#475569")
+        cancel.clicked.connect(dlg.reject)
+        save = styled_btn("Save", C_ACCENT, C_ACCENT_H)
+        btn_row.addWidget(cancel)
+        btn_row.addWidget(save)
+        lay.addLayout(btn_row)
+
+        def _do_save() -> None:
+            new_name = edit.text().strip()
+            if not new_name:
+                status.setText("Name cannot be empty.")
+                return
+            # Update in-memory cfg
+            cameras[row]["name"] = new_name
+            # Persist to config.yaml
+            try:
+                cfg_path = BASE_DIR / "config" / "config.yaml"
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    raw = yaml.safe_load(f)
+                cam_id = cam.get("id")
+                for c in raw.get("cameras", []):
+                    if c.get("id") == cam_id:
+                        c["name"] = new_name
+                        break
+                with open(cfg_path, "w", encoding="utf-8") as f:
+                    yaml.dump(raw, f, default_flow_style=False,
+                              allow_unicode=True)
+            except Exception as exc:
+                status.setText(f"Save failed: {exc}")
+                return
+            dlg.accept()
+            # Refresh table cell
+            self._table.item(row, 0).setText(new_name)
+
+        save.clicked.connect(_do_save)
+        edit.returnPressed.connect(_do_save)
+        dlg.exec()
+
+    def _remove_camera(self, row: int) -> None:
+        cameras = self._cfg.get("cameras", [])
+        if row >= len(cameras):
+            return
+        cam = cameras[row]
+        reply = QMessageBox.question(
+            self, "Remove Camera",
+            f"Remove camera <b>{cam.get('name', cam.get('id', ''))}</b>?<br>"
+            f"This updates config.yaml but takes effect after restart.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        cam_id = cam.get("id")
+        # Remove from in-memory cfg
+        self._cfg["cameras"] = [
+            c for c in cameras if c.get("id") != cam_id]
+        # Persist
+        try:
+            cfg_path = BASE_DIR / "config" / "config.yaml"
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                raw = yaml.safe_load(f)
+            raw["cameras"] = [
+                c for c in raw.get("cameras", []) if c.get("id") != cam_id]
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                yaml.dump(raw, f, default_flow_style=False,
+                          allow_unicode=True)
+        except Exception as exc:
+            QMessageBox.warning(self, "Error", f"Could not save config: {exc}")
+            return
+        self._table.removeRow(row)
+
+    def _add_camera(self) -> None:
+        dlg = AddCameraDialog(self._cfg, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            # Refresh the last row
+            self._populate()
+
+
+# ─────────────────────────────────────────────────────────────
+# Settings Dialog
+# ─────────────────────────────────────────────────────────────
+
+class SettingsDialog(QDialog):
+    """Four-tab settings dialog — reads / writes config.yaml live."""
+
+    def __init__(self, cfg: Dict, worker: "CameraWorker", parent=None) -> None:
+        super().__init__(parent)
+        self._cfg    = cfg
+        self._worker = worker
+
+        self.setWindowTitle("Settings")
+        self.setModal(True)
+        self.setMinimumSize(QSize(580, 500))
+        self.setStyleSheet(f"""
+            QDialog  {{ background: {C_PANEL}; color: {C_TEXT};
+                        font-family: 'Segoe UI', sans-serif; }}
+            QLabel   {{ color: {C_TEXT}; font-size: 13px; }}
+            QTabWidget::pane   {{ border: 1px solid {C_BORDER};
+                                  border-radius: 6px; background: {C_BG}; }}
+            QTabBar::tab       {{ background: {C_CARD}; color: {C_MUTED};
+                                  padding: 8px 18px; border-radius: 4px 4px 0 0;
+                                  margin-right: 2px; font-size: 12px; }}
+            QTabBar::tab:selected  {{ background: {C_PANEL}; color: {C_TEXT};
+                                      font-weight: 600; }}
+            QTabBar::tab:hover {{ color: {C_TEXT}; }}
+            QDoubleSpinBox, QSpinBox {{
+                background: {C_CARD}; color: {C_TEXT};
+                border: 1px solid {C_BORDER}; border-radius: 5px;
+                padding: 5px 8px; font-size: 12px; min-width: 100px; }}
+            QDoubleSpinBox:focus, QSpinBox:focus {{ border-color: {C_ACCENT}; }}
+            QComboBox  {{ background: {C_CARD}; color: {C_TEXT};
+                          border: 1px solid {C_BORDER}; border-radius: 5px;
+                          padding: 5px 8px; font-size: 12px; min-width: 140px; }}
+            QComboBox::drop-down {{ border: none; width: 22px; }}
+            QComboBox QAbstractItemView {{
+                background: {C_CARD}; color: {C_TEXT};
+                selection-background-color: {C_ACCENT}; }}
+            QLineEdit  {{ background: {C_CARD}; color: {C_TEXT};
+                          border: 1px solid {C_BORDER}; border-radius: 5px;
+                          padding: 5px 8px; font-size: 12px; }}
+            QLineEdit:focus {{ border-color: {C_ACCENT}; }}
+            QCheckBox  {{ color: {C_TEXT}; font-size: 12px; spacing: 8px; }}
+            QCheckBox::indicator {{
+                width: 16px; height: 16px;
+                border: 1px solid {C_BORDER}; border-radius: 4px;
+                background: {C_CARD}; }}
+            QCheckBox::indicator:checked {{
+                background: {C_ACCENT}; border-color: {C_ACCENT}; }}
+        """)
+        self._build_ui()
+
+    # ── Build ─────────────────────────────────────────────────
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 20, 20, 20)
+        root.setSpacing(12)
+
+        ttl = QLabel("Settings")
+        ttl.setStyleSheet(
+            f"font-size: 17px; font-weight: 700; color: {C_TEXT};")
+        root.addWidget(ttl)
+
+        tabs = QTabWidget()
+        tabs.addTab(self._tab_recognition(), "Detection & Recognition")
+        tabs.addTab(self._tab_alarm(),       "Alarm & Alerts")
+        tabs.addTab(self._tab_camera(),      "Camera Defaults")
+        tabs.addTab(self._tab_system(),      "System")
+        root.addWidget(tabs, stretch=1)
+
+        note = QLabel(
+            "⚡ Recognition threshold & tracking cooldown apply instantly "
+            "— all other changes require an app restart.")
+        note.setStyleSheet(
+            f"color: {C_AMBER}; font-size: 11px; padding: 2px 0;")
+        note.setWordWrap(True)
+        root.addWidget(note)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        cancel = styled_btn("Cancel", C_CARD, "#475569")
+        cancel.clicked.connect(self.reject)
+        ok = styled_btn("Save", C_ACCENT, C_ACCENT_H)
+        ok.clicked.connect(self._save_and_close)
+        btn_row.addWidget(cancel)
+        btn_row.addWidget(ok)
+        root.addLayout(btn_row)
+
+    @staticmethod
+    def _make_tab() -> tuple:
+        w    = QWidget()
+        outer = QVBoxLayout(w)
+        outer.setContentsMargins(18, 18, 18, 18)
+        outer.setSpacing(0)
+        form = QFormLayout()
+        form.setSpacing(14)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        form.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        outer.addLayout(form)
+        outer.addStretch()
+        return w, form
+
+    # ── Tab 1: Detection & Recognition ────────────────────────
+
+    def _tab_recognition(self) -> QWidget:
+        w, form = self._make_tab()
+        rec = self._cfg.get("recognition", {})
+        det = self._cfg.get("detection",   {})
+        trk = self._cfg.get("tracking",    {})
+
+        self._rec_thresh = QDoubleSpinBox()
+        self._rec_thresh.setRange(0.10, 0.95)
+        self._rec_thresh.setSingleStep(0.05)
+        self._rec_thresh.setValue(float(rec.get("threshold", 0.45)))
+        self._rec_thresh.setToolTip("Min similarity score to identify an employee")
+
+        self._det_thresh = QDoubleSpinBox()
+        self._det_thresh.setRange(0.10, 0.95)
+        self._det_thresh.setSingleStep(0.05)
+        self._det_thresh.setValue(float(det.get("det_thresh", 0.45)))
+        self._det_thresh.setToolTip("Min detector score to accept a face region")
+
+        self._min_face = QSpinBox()
+        self._min_face.setRange(10, 200)
+        self._min_face.setSingleStep(5)
+        self._min_face.setValue(int(det.get("min_face_size", 30)))
+        self._min_face.setSuffix(" px")
+
+        self._trk_cool = QSpinBox()
+        self._trk_cool.setRange(1, 300)
+        self._trk_cool.setSingleStep(5)
+        self._trk_cool.setValue(int(trk.get("cooldown_seconds", 30)))
+        self._trk_cool.setSuffix(" s")
+        self._trk_cool.setToolTip("Seconds before re-logging the same person")
+
+        self._trk_dist = QSpinBox()
+        self._trk_dist.setRange(20, 300)
+        self._trk_dist.setSingleStep(10)
+        self._trk_dist.setValue(int(trk.get("max_distance", 80)))
+        self._trk_dist.setSuffix(" px")
+
+        form.addRow("Recognition confidence:", self._rec_thresh)
+        form.addRow("Detection confidence:",   self._det_thresh)
+        form.addRow("Min face size:",          self._min_face)
+        form.addRow("Tracking cooldown:",      self._trk_cool)
+        form.addRow("Tracking max distance:",  self._trk_dist)
+        return w
+
+    # ── Tab 2: Alarm & Alerts ─────────────────────────────────
+
+    def _tab_alarm(self) -> QWidget:
+        w, form = self._make_tab()
+        al  = self._cfg.get("alarm",  {})
+        alt = self._cfg.get("alerts", {})
+
+        self._alarm_en = QCheckBox("Enable alarm")
+        self._alarm_en.setChecked(bool(al.get("enabled", False)))
+
+        self._alarm_cool = QSpinBox()
+        self._alarm_cool.setRange(5, 600)
+        self._alarm_cool.setSingleStep(5)
+        self._alarm_cool.setValue(int(al.get("cooldown_seconds", 30)))
+        self._alarm_cool.setSuffix(" s")
+
+        self._alarm_sound = QComboBox()
+        self._alarm_sound.addItems(["beep", "voice"])
+        self._alarm_sound.setCurrentText(al.get("sound", "voice"))
+
+        self._alarm_output = QComboBox()
+        self._alarm_output.addItems(["local", "camera", "both", "sdk"])
+        self._alarm_output.setCurrentText(al.get("output", "local"))
+
+        self._alarm_voice = QLineEdit(al.get("voice_text", "Intruder alert!"))
+
+        self._alert_unknown = QCheckBox("Alert on unknown person")
+        self._alert_unknown.setChecked(bool(alt.get("unknown_person", True)))
+
+        self._webhook = QLineEdit(alt.get("webhook_url", ""))
+        self._webhook.setPlaceholderText(
+            "https://hooks.slack.com/… (leave blank to disable)")
+
+        form.addRow("", self._alarm_en)
+        form.addRow("Alarm cooldown:",  self._alarm_cool)
+        form.addRow("Sound type:",      self._alarm_sound)
+        form.addRow("Output:",          self._alarm_output)
+        form.addRow("Voice text:",      self._alarm_voice)
+        form.addRow("", self._alert_unknown)
+        form.addRow("Webhook URL:",     self._webhook)
+        return w
+
+    # ── Tab 3: Camera Defaults ────────────────────────────────
+
+    def _tab_camera(self) -> QWidget:
+        w, form = self._make_tab()
+        perf = self._cfg.get("performance", {})
+        cams = self._cfg.get("cameras") or []
+        default_transport = cams[0].get("rtsp_transport", "udp") if cams else "udp"
+
+        self._cam_transport = QComboBox()
+        self._cam_transport.addItems(["udp", "tcp"])
+        self._cam_transport.setCurrentText(default_transport)
+        self._cam_transport.setToolTip(
+            "UDP = low latency (LAN)  ·  TCP = stable (WiFi/WAN)")
+
+        self._frame_skip = QSpinBox()
+        self._frame_skip.setRange(1, 10)
+        self._frame_skip.setValue(int(perf.get("frame_skip", 1)))
+        self._frame_skip.setToolTip("Process every Nth frame (1 = every frame)")
+
+        self._batch_size = QSpinBox()
+        self._batch_size.setRange(1, 16)
+        self._batch_size.setValue(int(perf.get("batch_size", 8)))
+
+        restart_note = QLabel("⚠ Restart required for these changes to take effect.")
+        restart_note.setStyleSheet(f"color: {C_AMBER}; font-size: 11px;")
+
+        form.addRow("RTSP transport:", self._cam_transport)
+        form.addRow("Frame skip:",     self._frame_skip)
+        form.addRow("Batch size:",     self._batch_size)
+        form.addRow("",                restart_note)
+        return w
+
+    # ── Tab 4: System ─────────────────────────────────────────
+
+    def _tab_system(self) -> QWidget:
+        w, form = self._make_tab()
+        log = self._cfg.get("logging",    {})
+        att = self._cfg.get("attendance", {})
+
+        self._log_level = QComboBox()
+        self._log_level.addItems(["DEBUG", "INFO", "WARNING", "ERROR"])
+        self._log_level.setCurrentText(log.get("level", "INFO"))
+
+        self._log_unknown = QCheckBox("Save unknown face crops  (logs/frames/)")
+        self._log_unknown.setChecked(bool(log.get("log_unknown_frames", False)))
+
+        self._att_conf = QDoubleSpinBox()
+        self._att_conf.setRange(0.10, 0.99)
+        self._att_conf.setSingleStep(0.05)
+        self._att_conf.setValue(float(att.get("confidence_threshold", 0.45)))
+        self._att_conf.setToolTip("Min confidence required to mark attendance")
+
+        self._shift_start = QLineEdit(att.get("shift_start", "") or "")
+        self._shift_start.setPlaceholderText("HH:MM  e.g. 08:30")
+        self._shift_start.setMaximumWidth(120)
+
+        self._shift_end = QLineEdit(att.get("shift_end", "") or "")
+        self._shift_end.setPlaceholderText("HH:MM  e.g. 17:30")
+        self._shift_end.setMaximumWidth(120)
+
+        restart_note = QLabel(
+            "⚠ Log level & attendance changes take effect after restart.")
+        restart_note.setStyleSheet(f"color: {C_AMBER}; font-size: 11px;")
+
+        form.addRow("Log level:",             self._log_level)
+        form.addRow("",                       self._log_unknown)
+        form.addRow("Attendance confidence:", self._att_conf)
+        form.addRow("Shift start:",           self._shift_start)
+        form.addRow("Shift end:",             self._shift_end)
+        form.addRow("",                       restart_note)
+        return w
+
+    # ── Save & apply ──────────────────────────────────────────
+
+    def _save_and_close(self) -> None:
+        cfg = self._cfg
+
+        # Detection & Recognition
+        cfg.setdefault("recognition", {})["threshold"]      = self._rec_thresh.value()
+        cfg.setdefault("detection",   {})["det_thresh"]     = self._det_thresh.value()
+        cfg.setdefault("detection",   {})["min_face_size"]  = self._min_face.value()
+        cfg.setdefault("tracking",    {})["cooldown_seconds"] = self._trk_cool.value()
+        cfg.setdefault("tracking",    {})["max_distance"]   = self._trk_dist.value()
+
+        # Live-apply threshold + tracking without requiring restart
+        try:
+            if self._worker.recognizer is not None:
+                self._worker.recognizer.threshold = self._rec_thresh.value()
+            if self._worker.tracker is not None:
+                self._worker.tracker.cooldown_seconds = float(self._trk_cool.value())
+        except Exception:
+            pass
+
+        # Alarm & Alerts
+        cfg.setdefault("alarm", {}).update({
+            "enabled":          self._alarm_en.isChecked(),
+            "cooldown_seconds": self._alarm_cool.value(),
+            "sound":            self._alarm_sound.currentText(),
+            "output":           self._alarm_output.currentText(),
+            "voice_text":       self._alarm_voice.text(),
+        })
+        cfg.setdefault("alerts", {}).update({
+            "unknown_person": self._alert_unknown.isChecked(),
+            "webhook_url":    self._webhook.text().strip(),
+        })
+
+        # Camera Defaults — apply transport to all cameras
+        transport = self._cam_transport.currentText()
+        for cam in cfg.get("cameras", []):
+            cam["rtsp_transport"] = transport
+        cfg.setdefault("performance", {}).update({
+            "frame_skip": self._frame_skip.value(),
+            "batch_size": self._batch_size.value(),
+        })
+
+        # System
+        cfg.setdefault("logging", {}).update({
+            "level":              self._log_level.currentText(),
+            "log_unknown_frames": self._log_unknown.isChecked(),
+        })
+        cfg.setdefault("attendance", {}).update({
+            "confidence_threshold": self._att_conf.value(),
+            "shift_start": self._shift_start.text().strip() or None,
+            "shift_end":   self._shift_end.text().strip()   or None,
+        })
+
+        # Persist to disk
+        try:
+            cfg_path = BASE_DIR / "config" / "config.yaml"
+            with open(cfg_path, "w", encoding="utf-8") as fh:
+                yaml.dump(cfg, fh, default_flow_style=False, allow_unicode=True)
+        except Exception as exc:
+            QMessageBox.warning(
+                self, "Save Warning",
+                f"Settings updated in memory but could not be written to disk:\n{exc}",
+            )
+
+        self.accept()
+
+
+# ─────────────────────────────────────────────────────────────
 # Main Window
 # ─────────────────────────────────────────────────────────────
 
@@ -1360,8 +2416,38 @@ class MainWindow(QMainWindow):
         self.db = EmployeeDatabase(db_url)
         self.db.initialize()
 
+        # ── Web-server bridge ────────────────────────────────
+        # Shared frame hub + logging service so the web dashboard
+        # consumes the same pipeline output as the Qt window.
+        self._frame_hub = _FrameHub()
+        log_cfg   = cfg.get("logging",  {})
+        alert_cfg = cfg.get("alerts",   {})
+        self._logging_svc = LoggingService(
+            db=self.db,
+            log_frames=log_cfg.get("log_unknown_frames", False),
+            frames_dir=log_cfg.get("frames_dir", "logs/frames"),
+            webhook_url=alert_cfg.get("webhook_url", ""),
+            unknown_alert=alert_cfg.get("unknown_person", True),
+        )
+        self._logging_svc.start()
+
+        # ── Attendance auto-export at 11:59 PM ───────────────
+        att_cfg = cfg.get("attendance", {})
+        self._attendance_exporter = AttendanceExporter(
+            db=self.db,
+            reports_dir=att_cfg.get("reports_dir", "reports"),
+        )
+        self._attendance_exporter.start()
+
+        # ── Greeting service (voice "Hi <name>") ─────────────
+        self._greeting_svc = GreetingService(cfg)
+        self._greeting_svc.start()
+
         # ── Camera worker ────────────────────────────────────
-        self.worker = CameraWorker(cfg, self.db)
+        self.worker = CameraWorker(cfg, self.db,
+                                   frame_hub=self._frame_hub,
+                                   logging_svc=self._logging_svc,
+                                   greeting_svc=self._greeting_svc)
         self.worker.detection.connect(self._on_detection)
         self.worker.status.connect(self._on_status)
         self.worker.fps_update.connect(self.stats_bar.update_fps
@@ -1386,8 +2472,25 @@ class MainWindow(QMainWindow):
         self._display_timer.timeout.connect(self._refresh_display)
         self._display_timer.start()
 
+
         # Start recognition
         self.worker.start()
+
+        # ── Start web server ─────────────────────────────────
+        qt_cam_mgr = _QtCameraManager()
+        for cam in cfg.get("cameras", []):
+            qt_cam_mgr.register(
+                cam["id"], self._frame_hub,
+                fps=cam.get("fps", 25),
+                resize_width=cam.get("resize_width", 0),
+                resize_height=cam.get("resize_height", 0),
+            )
+        api_port = int(cfg.get("api", {}).get("port", 8000))
+        _start_web_server(cfg, self.db, qt_cam_mgr,
+                          self._logging_svc, self.worker.recognizer,
+                          self.worker.detector)
+        # Show URL in status bar after a short delay (server needs ~1 s to bind)
+        QTimer.singleShot(1500, lambda: self._show_web_url(api_port))
 
     # ── UI construction ──────────────────────────────────────
 
@@ -1409,18 +2512,26 @@ class MainWindow(QMainWindow):
         self._status_lbl = QLabel("Starting…")
         self._status_lbl.setStyleSheet(
             f"color: {C_MUTED}; font-size: 12px;")
+        self._web_url_lbl = QLabel("🌐 Web: starting…")
+        self._web_url_lbl.setStyleSheet(
+            f"color: {C_GREEN}; font-size: 11px; padding: 0 6px;")
         att_btn = styled_btn("Attendance", C_GREEN, "#16a34a")
         att_btn.setFixedWidth(110)
         att_btn.clicked.connect(self._open_attendance)
-        cam_btn = styled_btn("+ Camera", C_CARD, "#475569")
+        cam_btn = styled_btn("📷 Cameras", C_CARD, "#475569")
         cam_btn.setFixedWidth(110)
-        cam_btn.clicked.connect(self._open_add_camera)
+        cam_btn.clicked.connect(self._open_camera_manager)
+        settings_btn = styled_btn("⚙ Settings", C_CARD, "#475569")
+        settings_btn.setFixedWidth(110)
+        settings_btn.clicked.connect(self._open_settings)
 
         trow.addWidget(ico)
         trow.addWidget(ttl)
         trow.addStretch()
+        trow.addWidget(settings_btn)
         trow.addWidget(cam_btn)
         trow.addWidget(att_btn)
+        trow.addWidget(self._web_url_lbl)
         trow.addWidget(self._status_lbl)
         root.addLayout(trow)
 
@@ -1428,7 +2539,24 @@ class MainWindow(QMainWindow):
         self.stats_bar = StatsBar()
         root.addWidget(self.stats_bar)
 
-        # Three-panel splitter
+        # Main tab widget — Live View + Unknown Persons
+        main_tabs = QTabWidget()
+        main_tabs.setStyleSheet(f"""
+            QTabWidget::pane   {{ border: none; background: transparent; }}
+            QTabBar::tab       {{ background: {C_CARD}; color: {C_MUTED};
+                                  padding: 6px 18px; border-radius: 4px;
+                                  margin-right: 2px; font-size: 12px; }}
+            QTabBar::tab:selected {{ background: {C_ACCENT}; color: white; }}
+            QTabBar::tab:hover    {{ background: {C_BORDER}; color: {C_TEXT}; }}
+        """)
+
+        # ── Tab 1: Live View (three-panel splitter) ───────────
+        live_widget = QWidget()
+        live_widget.setStyleSheet("background: transparent;")
+        live_lay = QVBoxLayout(live_widget)
+        live_lay.setContentsMargins(0, 6, 0, 0)
+        live_lay.setSpacing(0)
+
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setHandleWidth(2)
 
@@ -1445,7 +2573,15 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self.log_panel)
         splitter.setStretchFactor(1, 1)
 
-        root.addWidget(splitter, stretch=1)
+        live_lay.addWidget(splitter)
+        main_tabs.addTab(live_widget, "📹  Live View")
+
+        # ── Tab 2: Unknown Persons ────────────────────────────
+        frames_dir = self.cfg.get("logging", {}).get("frames_dir", "logs/frames")
+        self.unknown_panel = UnknownPersonsPanel(frames_dir=frames_dir)
+        main_tabs.addTab(self.unknown_panel, "👤  Unknown Persons")
+
+        root.addWidget(main_tabs, stretch=1)
 
     # ── Signal handlers ──────────────────────────────────────
 
@@ -1456,9 +2592,24 @@ class MainWindow(QMainWindow):
 
     def _on_detection(self, event: Dict) -> None:
         self.log_panel.add_event(event)
+        # Refresh unknown captures panel shortly after — gives LoggingService
+        # time to finish writing the file to disk (~500 ms is sufficient).
+        if not event.get("is_known"):
+            QTimer.singleShot(800, self.unknown_panel.refresh)
 
     def _on_status(self, msg: str) -> None:
         self._status_lbl.setText(msg)
+
+    def _show_web_url(self, port: int) -> None:
+        import socket
+        try:
+            host_ip = socket.gethostbyname(socket.gethostname())
+        except Exception:
+            host_ip = "localhost"
+        url = f"http://{host_ip}:{port}"
+        self._web_url_lbl.setText(f"🌐 Web: {url}")
+        self._web_url_lbl.setToolTip(
+            f"Open {url} in any browser on this network")
 
     # ── Data helpers ─────────────────────────────────────────
 
@@ -1471,8 +2622,16 @@ class MainWindow(QMainWindow):
 
     # ── Actions ──────────────────────────────────────────────
 
+    def _open_settings(self) -> None:
+        dlg = SettingsDialog(self.cfg, self.worker, self)
+        dlg.exec()
+
     def _open_attendance(self) -> None:
         dlg = AttendanceDialog(self.db, self)
+        dlg.exec()
+
+    def _open_camera_manager(self) -> None:
+        dlg = CameraManagerDialog(self.cfg, self)
         dlg.exec()
 
     def _open_add_camera(self) -> None:
@@ -1522,6 +2681,18 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         self.worker.stop()
         self.worker.wait(4_000)
+        try:
+            self._logging_svc.stop()
+        except Exception:
+            pass
+        try:
+            self._greeting_svc.stop()
+        except Exception:
+            pass
+        try:
+            self._attendance_exporter.stop()
+        except Exception:
+            pass
         super().closeEvent(event)
 
 
