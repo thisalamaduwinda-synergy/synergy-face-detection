@@ -106,6 +106,7 @@ class FaceDetector:
         insightface_model: str = "buffalo_l",
         insightface_root: str = "data/models/insightface",
         insightface_det_size: Tuple[int, int] = (640, 640),
+        use_gpu: bool = False,
     ) -> None:
         self.yunet_model = str(yunet_model)
         self.sface_model = str(sface_model)
@@ -116,6 +117,7 @@ class FaceDetector:
         self.insightface_model = insightface_model
         self.insightface_root = str(insightface_root)
         self.insightface_det_size = tuple(insightface_det_size)
+        self.use_gpu = use_gpu
 
         self._detector: Optional[cv2.FaceDetectorYN] = None
         self._recognizer: Optional[cv2.FaceRecognizerSF] = None
@@ -192,18 +194,19 @@ class FaceDetector:
         )
         t0 = time.perf_counter()
 
+        ctx_id = 0 if self.use_gpu else -1
         try:
             self._if_app = FaceAnalysis(
                 name=self.insightface_model,
                 root=str(root_dir),
             )
             self._if_app.prepare(
-                ctx_id=-1,
+                ctx_id=ctx_id,
                 det_thresh=float(self.det_thresh),
                 det_size=self.insightface_det_size,
             )
             elapsed = time.perf_counter() - t0
-            logger.info("InsightFace ready (%.2fs)", elapsed)
+            logger.info("InsightFace ready (%.2fs) [%s]", elapsed, "GPU" if self.use_gpu else "CPU")
             return True
         except Exception as exc:
             logger.warning("InsightFace initialisation failed: %s", exc)
@@ -221,7 +224,7 @@ class FaceDetector:
                     root=str(root_dir),
                 )
                 self._if_app.prepare(
-                    ctx_id=-1,
+                    ctx_id=ctx_id,
                     det_thresh=float(self.det_thresh),
                     det_size=self.insightface_det_size,
                 )

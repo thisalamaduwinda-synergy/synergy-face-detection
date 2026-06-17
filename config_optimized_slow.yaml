@@ -1,3 +1,7 @@
+# config_optimized_slow.yaml
+# Optimized for slower/older systems with limited CPU
+# Prioritizes smooth video feed over detection frequency
+
 alarm:
   cooldown_seconds: 5
   enabled: true
@@ -15,13 +19,15 @@ attendance:
   confidence_threshold: 0.6
   reports_dir: reports
   shift_end: null
-  shift_start: 08:15
+  shift_start: null
 cameras:
-- fps: 25
+- fps: 20                          # Lower FPS - still smooth
   id: FaceRecognitionsystem
   name: Main Entrance
   rtsp_transport: tcp
   source: rtsp://admin:Synergy2026@192.168.1.64:554/Streaming/Channels/101
+  resize_width: 1280               # Downscale camera feed
+  resize_height: 720
 dashboard:
   enabled: true
   host: 0.0.0.0
@@ -40,24 +46,14 @@ detection:
   backend: insightface
   det_thresh: 0.6
   insightface_det_size:
-  - 320
-  - 320
+  - 640
+  - 640
   insightface_model: buffalo_l
   insightface_root: data/models/insightface
   min_face_size: 20
   nms_thresh: 0.4
   sface_model: data/models/face_recognition_sface_2021dec.onnx
   yunet_model: data/models/face_detection_yunet_2023mar.onnx
-email:
-  attach_excel: true
-  enabled: true
-  recipients:
-  - thisala.maduwinda@synergypharma.lk
-  sender: thisala.maduwinda@synergypharma.lk
-  smtp_host: smtp.office365.com
-  smtp_port: 587
-  subject_prefix: Daily Attendance Report - Synergy Pharma
-  use_tls: true
 greeting:
   camera_channel: 1
   camera_host: 192.168.1.64
@@ -81,11 +77,14 @@ logging:
   log_unknown_frames: true
   max_size_mb: 100
 performance:
-  batch_size: 4
+  batch_size: 2                   # Smaller batch size
   display_results: true
-  frame_skip: 1
-  num_threads: 4
+  frame_skip: 2                   # Process every 2nd frame (detection)
+  num_threads: 2                  # Fewer threads
   use_gpu: false
+  adaptive_fps: true              # Enable adaptive FPS
+  render_buffer_size: 3           # Fewer frames in buffer
+  jpeg_quality: 40                # Lower quality for faster streaming
 recognition:
   embedding_dim: 512
   threshold: 0.6

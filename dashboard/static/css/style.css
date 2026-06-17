@@ -153,8 +153,10 @@ html, body {
 
 .camera-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
-  gap: 16px;
+  grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+  gap: 12px;
+  padding: 8px;
+  will-change: contents;
 }
 
 .camera-tile {
@@ -163,6 +165,8 @@ html, body {
   border-radius: var(--radius);
   overflow: hidden;
   position: relative;
+  contain: layout style paint;
+  transition: none;
 }
 
 .camera-tile-header {
@@ -183,6 +187,10 @@ html, body {
   object-fit: cover;
   display: block;
   background: #000;
+  will-change: transform;
+  backface-visibility: hidden;
+  -webkit-font-smoothing: antialiased;
+  transform: translateZ(0);
 }
 
 /* ── Active identifications overlay ────────────────────────── */

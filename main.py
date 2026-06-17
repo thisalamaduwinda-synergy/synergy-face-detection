@@ -221,25 +221,45 @@ class RecognitionPipeline:
                     frame=frame if self.cfg["logging"].get("log_unknown_frames") and not result.is_known else None,
                 )
 
-            # ── Attendance marking ───────────────────────────
+            # ── Attendance marking / VIP visit tracking ──────
             if result.is_known and result.confidence >= self.attendance_threshold:
                 try:
-                    is_new = self.db.mark_attendance(
-                        employee_id=result.employee_id,
-                        employee_name=result.name,
-                        camera_id=cam_id,
-                        confidence=result.confidence,
-                        department=result.department,
-                        shift_start=self.shift_start,
-                        shift_end=self.shift_end,
-                    )
-                    if is_new:
-                        logger.info(
-                            "Attendance: {} ({}) — confidence {:.1%}",
-                            result.name, result.employee_id, result.confidence,
+                    if result.is_vip:
+                        is_new = self.db.mark_vip_visit(
+                            employee_id=result.employee_id,
+                            employee_name=result.name,
+                            camera_id=cam_id,
+                            confidence=result.confidence,
+                            department=result.department,
+                            company_id=result.company_id,
                         )
+                        if is_new:
+                            logger.info(
+                                "VIP IN: {} ({}) — confidence {:.1%}",
+                                result.name, result.employee_id, result.confidence,
+                            )
+                        else:
+                            logger.debug(
+                                "VIP OUT updated: {} ({})",
+                                result.name, result.employee_id,
+                            )
+                    else:
+                        is_new = self.db.mark_attendance(
+                            employee_id=result.employee_id,
+                            employee_name=result.name,
+                            camera_id=cam_id,
+                            confidence=result.confidence,
+                            department=result.department,
+                            shift_start=self.shift_start,
+                            shift_end=self.shift_end,
+                        )
+                        if is_new:
+                            logger.info(
+                                "Attendance: {} ({}) — confidence {:.1%}",
+                                result.name, result.employee_id, result.confidence,
+                            )
                 except Exception as exc:
-                    logger.warning("Attendance mark failed for {}: {}", result.employee_id, exc)
+                    logger.warning("Attendance/VIP mark failed for {}: {}", result.employee_id, exc)
 
             # ── Door unlock + voice greeting ─────────────────
             if result.is_known:
@@ -254,6 +274,7 @@ class RecognitionPipeline:
                     self.greeting_service.greet(
                         employee_id=result.employee_id,
                         employee_name=result.name,
+                        is_vip=result.is_vip,
                     )
 
             # ── Build annotation label ───────────────────────
@@ -332,6 +353,7 @@ def main(config_path: str, no_display: bool = False, camera_source=None) -> None
 
     # ── Face detector ─────────────────────────────────────────
     det_cfg  = cfg.get("detection", {})
+    perf_cfg = cfg.get("performance", {})
     detector = FaceDetector(
         yunet_model=det_cfg.get("yunet_model", "data/models/face_detection_yunet_2023mar.onnx"),
         sface_model=det_cfg.get("sface_model", "data/models/face_recognition_sface_2021dec.onnx"),
@@ -342,6 +364,7 @@ def main(config_path: str, no_display: bool = False, camera_source=None) -> None
         insightface_model=det_cfg.get("insightface_model", "buffalo_l"),
         insightface_root=det_cfg.get("insightface_root", "data/models/insightface"),
         insightface_det_size=tuple(det_cfg.get("insightface_det_size", [640, 640])),
+        use_gpu=bool(perf_cfg.get("use_gpu", False)),
     )
     detector.initialize()
 

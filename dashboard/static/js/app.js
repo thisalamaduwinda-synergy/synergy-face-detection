@@ -364,7 +364,7 @@
             $addCameraFeedback.className = "form-feedback success";
             $addCameraFeedback.textContent = `✓ ${json.message}`;
           }
-          fetchStats();
+          fetchStatsThrottled();
           setTimeout(closeAddCameraModal, 1200);
         } else {
           if ($addCameraFeedback) {
@@ -384,33 +384,45 @@
   // But we also need the remove button in the tile header — add it to innerHTML:
   // (handled above via tile.querySelector inside addCameraCard)
 
-  // ── Stats polling ──────────────────────────────────────────
-  async function fetchStats() {
-    try {
-      const [statsRes, camRes] = await Promise.all([
-        authFetch(`${API_BASE}/api/stats`),
-        authFetch(`${API_BASE}/api/cameras`),
-      ]);
+  // ── Stats polling (debounced for performance) ──────────────
+  let _statsTimeout = null;
+  function fetchStatsThrottled() {
+    if (_statsTimeout) return;
+    _statsTimeout = setTimeout(async () => {
+      _statsTimeout = null;
+      try {
+        const [statsRes, camRes] = await Promise.all([
+          authFetch(`${API_BASE}/api/stats`),
+          authFetch(`${API_BASE}/api/cameras`),
+        ]);
 
-      if (statsRes.ok) {
-        const data = await statsRes.json();
-        const db = data.database || {};
-        $statEmp.textContent     = db.registered_employees ?? "–";
-        $statTotal.textContent   = db.total_detections    ?? "–";
-        $statKnown.textContent   = db.known_detections    ?? "–";
-        $statUnknown.textContent = db.unknown_detections  ?? "–";
-      }
+        if (statsRes.ok) {
+          const data = await statsRes.json();
+          const db = data.database || {};
+          // Batch DOM updates to reduce reflow
+          requestAnimationFrame(() => {
+            if ($statEmp && ($statEmp.textContent !== String(db.registered_employees ?? "–")))
+              $statEmp.textContent = db.registered_employees ?? "–";
+            if ($statTotal && ($statTotal.textContent !== String(db.total_detections ?? "–")))
+              $statTotal.textContent = db.total_detections ?? "–";
+            if ($statKnown && ($statKnown.textContent !== String(db.known_detections ?? "–")))
+              $statKnown.textContent = db.known_detections ?? "–";
+            if ($statUnknown && ($statUnknown.textContent !== String(db.unknown_detections ?? "–")))
+              $statUnknown.textContent = db.unknown_detections ?? "–";
+          });
+        }
 
-      if (camRes.ok) {
-        const cams = await camRes.json();
-        refreshCameras(cams);
+        if (camRes.ok) {
+          const cams = await camRes.json();
+          requestAnimationFrame(() => refreshCameras(cams));
+        }
+      } catch (e) {
+        console.warn("Stats fetch error:", e);
       }
-    } catch (e) {
-      console.warn("Stats fetch error:", e);
-    }
+    }, 500);  // Debounce rapid updates
   }
 
-  setInterval(fetchStats, STATS_POLL_MS);
+  setInterval(fetchStatsThrottled, STATS_POLL_MS);
 
   // ── Filter toggle ──────────────────────────────────────────
   $filterCb.addEventListener("change", () => {
@@ -490,9 +502,8 @@
         showFeedback("success", `✓ ${json.message}`);
         _stopWebcam();
         $regForm.reset();
-        fetchStats();
+        fetchStatsThrottled();
         fetchEmployees();
-      } else {
         showFeedback("error", `✗ ${json.detail || "Registration failed."}`);
       }
     } catch (err) {

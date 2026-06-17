@@ -1,3 +1,7 @@
+# config_optimized_desktop.yaml
+# Optimized for desktop systems with good CPU/GPU
+# Use this for smooth, high-quality camera feed
+
 alarm:
   cooldown_seconds: 5
   enabled: true
@@ -15,9 +19,9 @@ attendance:
   confidence_threshold: 0.6
   reports_dir: reports
   shift_end: null
-  shift_start: 08:15
+  shift_start: null
 cameras:
-- fps: 25
+- fps: 30                          # High FPS for smooth video
   id: FaceRecognitionsystem
   name: Main Entrance
   rtsp_transport: tcp
@@ -40,24 +44,14 @@ detection:
   backend: insightface
   det_thresh: 0.6
   insightface_det_size:
-  - 320
-  - 320
+  - 640
+  - 640
   insightface_model: buffalo_l
   insightface_root: data/models/insightface
   min_face_size: 20
   nms_thresh: 0.4
   sface_model: data/models/face_recognition_sface_2021dec.onnx
   yunet_model: data/models/face_detection_yunet_2023mar.onnx
-email:
-  attach_excel: true
-  enabled: true
-  recipients:
-  - thisala.maduwinda@synergypharma.lk
-  sender: thisala.maduwinda@synergypharma.lk
-  smtp_host: smtp.office365.com
-  smtp_port: 587
-  subject_prefix: Daily Attendance Report - Synergy Pharma
-  use_tls: true
 greeting:
   camera_channel: 1
   camera_host: 192.168.1.64
@@ -81,11 +75,14 @@ logging:
   log_unknown_frames: true
   max_size_mb: 100
 performance:
-  batch_size: 4
+  batch_size: 8              # Higher batch size for better throughput
   display_results: true
-  frame_skip: 1
-  num_threads: 4
+  frame_skip: 1              # No frame skipping - process every frame
+  num_threads: 4             # Use more threads
   use_gpu: false
+  adaptive_fps: true         # Enable adaptive FPS
+  render_buffer_size: 6      # More frames in buffer
+  jpeg_quality: 60           # Good balance between quality and speed
 recognition:
   embedding_dim: 512
   threshold: 0.6

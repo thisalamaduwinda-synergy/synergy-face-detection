@@ -53,6 +53,8 @@ class RecognitionResult:
     confidence: float                   # cosine similarity [0, 1]
     is_known: bool
     latency_ms: float = 0.0
+    is_vip: bool = False
+    company_id: str = ""
     # Bounding box copied from detection for downstream use
     bbox: Optional[Tuple[int, int, int, int]] = None
 
@@ -259,6 +261,8 @@ class FaceRecognizer:
             confidence=round(best_score, 4),
             is_known=True,
             latency_ms=round(latency_ms, 2),
+            is_vip=bool(emp.get("is_vip", False)),
+            company_id=emp.get("company_id", ""),
         )
 
     def recognize_batch(
@@ -308,12 +312,14 @@ class FaceRecognizer:
                     emp = self._id_map[best_idx]
                 results.append(
                     RecognitionResult(
-                        emp.get("employee_id", UNKNOWN_ID),
-                        emp.get("name", UNKNOWN_LABEL),
-                        emp.get("department", ""),
-                        round(best_score, 4),
-                        True,
-                        round(latency_each, 2),
+                        employee_id=emp.get("employee_id", UNKNOWN_ID),
+                        name=emp.get("name", UNKNOWN_LABEL),
+                        department=emp.get("department", ""),
+                        confidence=round(best_score, 4),
+                        is_known=True,
+                        latency_ms=round(latency_each, 2),
+                        is_vip=bool(emp.get("is_vip", False)),
+                        company_id=emp.get("company_id", ""),
                     )
                 )
 
