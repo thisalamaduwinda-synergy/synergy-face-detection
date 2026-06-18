@@ -370,6 +370,12 @@ class CameraWorker(QThread):
         self._frame_lock = self._cam_locks.get(self._cam_id, threading.Lock())
         # Detection lock — shared detector is not thread-safe for concurrent inference
         self._detect_lock = threading.Lock()
+        # Latest raw frame per camera — shared between display and detection threads
+        self._cam_latest_raw:  Dict[str, Optional[np.ndarray]] = {cid: None for cid in _cam_ids}
+        self._cam_raw_locks:   Dict[str, threading.Lock]       = {cid: threading.Lock() for cid in _cam_ids}
+        # Cached bbox annotations from last detection pass (written by detect, read by display)
+        self._cam_bboxes:      Dict[str, list]                 = {cid: [] for cid in _cam_ids}
+        self._cam_bbox_locks:  Dict[str, threading.Lock]       = {cid: threading.Lock() for cid in _cam_ids}
         # Active CameraStream instances (populated in run())
         self._cam_streams: Dict[str, CameraStream] = {}
         self._cam: Optional[CameraStream] = None  # backward compat: first stream
@@ -395,6 +401,7 @@ class CameraWorker(QThread):
             insightface_model = det.get("insightface_model", "buffalo_l"),
             insightface_root = det.get("insightface_root", "data/models/insightface"),
             insightface_det_size = tuple(det.get("insightface_det_size", [640, 640])),
+            use_gpu       = bool(cfg.get("performance", {}).get("use_gpu", False)),
         )
 
         # Dedicated registration detector (isolated from live pipeline state)
@@ -519,6 +526,7 @@ class CameraWorker(QThread):
             if not src:
                 logger.warning("Camera '%s' has no source — skipped.", cid)
                 continue
+
             stream = CameraStream(
                 camera_id      = cid,
                 source         = src,
@@ -541,14 +549,21 @@ class CameraWorker(QThread):
 
         _threads = []
         for cid, stream in self._cam_streams.items():
-            t = threading.Thread(
+            t_disp = threading.Thread(
                 target=self._cam_loop,
                 args=(cid, stream),
                 daemon=True,
-                name=f"cam-loop-{cid}",
+                name=f"cam-display-{cid}",
             )
-            t.start()
-            _threads.append(t)
+            t_det = threading.Thread(
+                target=self._detect_loop,
+                args=(cid,),
+                daemon=True,
+                name=f"cam-detect-{cid}",
+            )
+            t_disp.start()
+            t_det.start()
+            _threads.extend([t_disp, t_det])
 
         for t in _threads:
             t.join()
@@ -556,22 +571,125 @@ class CameraWorker(QThread):
     # ── Per-camera processing loop (runs in background thread) ──
 
     def _cam_loop(self, cam_id: str, cam: CameraStream) -> None:
+        """Display loop — throttled to camera FPS, unblocked by detection.
+        Uses Haar cascade to track face positions in real-time so boxes
+        stay centred on faces even between InsightFace detection cycles."""
         is_primary = (cam_id == self._cam_id)
         fps_count  = 0
         fps_ts     = time.time()
+        _frame_ms  = 1.0 / max(cam.target_fps, 1)
+        _last_t    = 0.0
+        _stale     = 0
+        _MAX_STALE = 8   # frames to keep last box when cascade misses (~0.3 s at 25 fps)
+
+        _cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        )
 
         while self._running:
-            frame_obj = cam.read_latest(timeout=0.15)
+            now = time.time()
+            gap = _frame_ms - (now - _last_t)
+            if gap > 0:
+                time.sleep(gap)
+
+            frame_obj = cam.read_latest(timeout=_frame_ms * 2)
             if frame_obj is None:
                 continue
+            _last_t = time.time()
 
             raw = frame_obj.frame
+            h, w = raw.shape[:2]
 
             if is_primary:
                 with self._raw_lock:
                     self._latest_raw = raw.copy()
 
+            with self._cam_raw_locks[cam_id]:
+                self._cam_latest_raw[cam_id] = raw
+
+            with self._cam_bbox_locks[cam_id]:
+                cached = list(self._cam_bboxes[cam_id])
+
             annotated = raw.copy()
+
+            if cached:
+                # Downscale for fast cascade (keep under 640 px wide)
+                scale  = min(1.0, 640.0 / w)
+                small  = cv2.resize(raw, (int(w * scale), int(h * scale))) if scale < 1.0 else raw
+                gray   = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+                cfaces = _cascade.detectMultiScale(
+                    gray, scaleFactor=1.1, minNeighbors=5,
+                    minSize=(max(30, int(40 * scale)), max(30, int(40 * scale))),
+                )
+
+                if len(cfaces) > 0:
+                    _stale = 0
+                    for (cx, cy, cw, ch) in cfaces:
+                        if scale < 1.0:
+                            cx = int(cx / scale); cy = int(cy / scale)
+                            cw = int(cw / scale); ch = int(ch / scale)
+                        nx1, ny1, nx2, ny2 = cx, cy, cx + cw, cy + ch
+                        fc_x = cx + cw // 2
+                        fc_y = cy + ch // 2
+
+                        # Match to nearest cached InsightFace identity
+                        best_lbl  = "Unknown"
+                        best_col  = (50, 50, 220)
+                        best_dist = float("inf")
+                        for (ox1, oy1, ox2, oy2), lbl, col in cached:
+                            d = ((fc_x - (ox1 + ox2) // 2) ** 2 +
+                                 (fc_y - (oy1 + oy2) // 2) ** 2) ** 0.5
+                            if d < best_dist:
+                                best_dist, best_lbl, best_col = d, lbl, col
+
+                        if best_dist < max(w, h) * 0.4:
+                            cv2.rectangle(annotated, (nx1, ny1), (nx2, ny2), best_col, 2)
+                            cv2.rectangle(annotated, (nx1, ny1 - 26), (nx2, ny1),
+                                          best_col, cv2.FILLED)
+                            cv2.putText(annotated, best_lbl, (nx1 + 4, ny1 - 6),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.56,
+                                        (255, 255, 255), 1, cv2.LINE_AA)
+                else:
+                    _stale += 1
+                    if _stale < _MAX_STALE:
+                        for (x1, y1, x2, y2), lbl, col in cached:
+                            cv2.rectangle(annotated, (x1, y1), (x2, y2), col, 2)
+                            cv2.rectangle(annotated, (x1, y1 - 26), (x2, y1),
+                                          col, cv2.FILLED)
+                            cv2.putText(annotated, lbl, (x1 + 4, y1 - 6),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.56,
+                                        (255, 255, 255), 1, cv2.LINE_AA)
+
+            with self._cam_locks[cam_id]:
+                self._cam_annotated[cam_id] = annotated
+            if self._frame_hub is not None:
+                self._frame_hub.push(cam_id, annotated)
+
+            fps_count += 1
+            now = time.time()
+            if now - fps_ts >= 1.0:
+                self.fps_update.emit(fps_count / (now - fps_ts))
+                fps_count = 0
+                fps_ts    = now
+
+        self.status.emit("Camera stopped.")
+
+    def _detect_loop(self, cam_id: str) -> None:
+        """Detection loop — runs independently, heavy work never touches the display."""
+        _MIN_INTERVAL = 0.10
+
+        while self._running:
+            # Grab latest raw frame
+            with self._cam_raw_locks[cam_id]:
+                src = self._cam_latest_raw.get(cam_id)
+            if src is None:
+                time.sleep(0.05)
+                continue
+
+            raw = src.copy()           # own copy so display thread is free
+            detect_annotated = raw.copy()
+            new_boxes: list = []
+
             try:
                 with self._detect_lock:
                     faces = self.detector.detect(raw)
@@ -625,7 +743,7 @@ class CameraWorker(QThread):
                                     confidence    = result.confidence,
                                     is_known      = result.is_known,
                                     bbox          = list(face.bbox),
-                                    frame         = annotated if not result.is_known else None,
+                                    frame         = detect_annotated if not result.is_known else None,
                                 )
                             else:
                                 self.db.log_detection(
@@ -665,29 +783,22 @@ class CameraWorker(QThread):
 
                     x1, y1, x2, y2 = face.bbox
                     box_color = (40, 220, 80) if result.is_known else (50, 50, 220)
-                    cv2.rectangle(annotated, (x1, y1), (x2, y2), box_color, 2)
                     label = f"{result.name}  {result.confidence:.0%}"
-                    cv2.rectangle(annotated, (x1, y1 - 26), (x2, y1), box_color, cv2.FILLED)
-                    cv2.putText(annotated, label, (x1 + 4, y1 - 6),
+                    cv2.rectangle(detect_annotated, (x1, y1), (x2, y2), box_color, 2)
+                    cv2.rectangle(detect_annotated, (x1, y1 - 26), (x2, y1), box_color, cv2.FILLED)
+                    cv2.putText(detect_annotated, label, (x1 + 4, y1 - 6),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.56,
                                 (255, 255, 255), 1, cv2.LINE_AA)
+                    new_boxes.append(((x1, y1, x2, y2), label, box_color))
 
             except Exception as exc:
-                logger.exception("[%s] Frame processing error: %s", cam_id, exc)
+                logger.exception("[%s] Detection error: %s", cam_id, exc)
 
-            with self._cam_locks[cam_id]:
-                self._cam_annotated[cam_id] = annotated
+            with self._cam_bbox_locks[cam_id]:
+                self._cam_bboxes[cam_id] = new_boxes
 
-            if self._frame_hub is not None:
-                self._frame_hub.push(cam_id, annotated)
-
-            fps_count += 1
-            now = time.time()
-            if now - fps_ts >= 1.0:
-                self.fps_update.emit(fps_count / (now - fps_ts))
-                fps_count = 0
-                fps_ts    = now
-        self.status.emit("Camera stopped.")
+            # Brief pause before next detection cycle
+            time.sleep(_MIN_INTERVAL)
 
 
 # ─────────────────────────────────────────────────────────────

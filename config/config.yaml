@@ -18,10 +18,10 @@ attendance:
   shift_start: 08:15
 cameras:
 - fps: 25
-  id: FaceRecognitionsystem
-  name: Main Entrance
+  id: Entrance
+  name: Entrance
   rtsp_transport: tcp
-  source: rtsp://admin:Synergy2026@192.168.1.64:554/Streaming/Channels/101
+  source: rtsp://admin:Synergy2026@169.254.18.90:554/Streaming/Channels/101
 dashboard:
   enabled: true
   host: 0.0.0.0
@@ -60,7 +60,7 @@ email:
   use_tls: true
 greeting:
   camera_channel: 1
-  camera_host: 192.168.1.64
+  camera_host: 169.254.18.90
   camera_password: Synergy2026
   camera_user: admin
   cooldown_seconds: 0
@@ -82,7 +82,7 @@ logging:
   max_size_mb: 100
 performance:
   batch_size: 4
-  display_results: true
+  display_results: false
   frame_skip: 1
   num_threads: 4
   use_gpu: false

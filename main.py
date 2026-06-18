@@ -176,13 +176,25 @@ class RecognitionPipeline:
             return
 
         logger.info("Processing loop started for camera: {}", cam_id)
+        _last_process_time = 0.0
+        # Process at most 10fps for recognition — prevents CPU saturation when
+        # a face is present (ArcFace embedding is expensive on CPU-only systems).
+        _MIN_INTERVAL = 0.10
+
         while self._running:
+            now = time.time()
+            elapsed = now - _last_process_time
+            if elapsed < _MIN_INTERVAL:
+                time.sleep(_MIN_INTERVAL - elapsed)
+                continue
+
             # read_latest() always returns the newest frame, so slow
             # processing never causes the pipeline to fall further behind.
             frame_obj = cam.read_latest(timeout=0.15)
             if frame_obj is None:
                 continue
 
+            _last_process_time = time.time()
             try:
                 self._process_frame(frame_obj)
             except Exception as exc:
