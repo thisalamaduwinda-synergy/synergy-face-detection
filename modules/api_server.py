@@ -978,6 +978,67 @@ def create_app(
         )
 
     # ═══════════════════════════════════════════════════════
+    # VIP Visit endpoints
+    # ═══════════════════════════════════════════════════════
+
+    @app.get("/api/vip-visits")
+    async def get_vip_visits_today(
+        company_id: Optional[str] = None,
+        _: None = Depends(require_auth),
+    ):
+        """Return today's VIP visit records (in/out times)."""
+        import datetime as _dt
+        records = db.get_vip_visits(company_id=company_id)
+        return {"date": str(_dt.date.today()), "visits": records, "count": len(records)}
+
+    @app.get("/api/vip-visits/{target_date}")
+    async def get_vip_visits_by_date(
+        target_date: str,
+        company_id: Optional[str] = None,
+        _: None = Depends(require_auth),
+    ):
+        """Return VIP visit records for a specific date (YYYY-MM-DD)."""
+        try:
+            from datetime import date as _date
+            d = _date.fromisoformat(target_date)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+        records = db.get_vip_visits(target_date=d, company_id=company_id)
+        return {"date": target_date, "visits": records, "count": len(records)}
+
+    @app.get("/api/vip-visits-range")
+    async def get_vip_visits_range(
+        start: str,
+        end: str,
+        employee_id: Optional[str] = None,
+        _: None = Depends(require_auth),
+    ):
+        """Return VIP visit records between start and end dates (YYYY-MM-DD)."""
+        try:
+            from datetime import date as _date
+            s = _date.fromisoformat(start)
+            e = _date.fromisoformat(end)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+        records = db.get_vip_visits_range(start=s, end=e, employee_id=employee_id)
+        return {"start": start, "end": end, "visits": records, "count": len(records)}
+
+    @app.put("/api/employees/{employee_id}/vip")
+    async def set_employee_vip(
+        employee_id: str,
+        is_vip: bool = True,
+        _: None = Depends(require_auth),
+    ):
+        """Set or clear VIP status for an employee."""
+        ok = db.set_vip_status(employee_id, is_vip)
+        if not ok:
+            raise HTTPException(status_code=404, detail=f"Employee '{employee_id}' not found.")
+        if recognizer is not None:
+            all_emps = db.get_all_employees_with_embeddings()
+            recognizer.build_index(all_emps)
+        return {"employee_id": employee_id, "is_vip": is_vip, "status": "updated"}
+
+    # ═══════════════════════════════════════════════════════
     # Door control endpoints
     # ═══════════════════════════════════════════════════════
 
@@ -1013,21 +1074,69 @@ def create_app(
         async def frame_generator():
             boundary = b"--frame\r\n"
             header = b"Content-Type: image/jpeg\r\n\r\n"
+            _NO_SIGNAL_INTERVAL = 1.0   # send placeholder at 1 fps when offline
+            _last_no_signal = 0.0
+            _no_signal_jpeg: Optional[bytes] = None
+            # ── Performance tuning ──────────────────────────
+            _target_fps = min(cam.target_fps or 25, 25)  # cap at 25 fps max
+            _frame_interval = 1.0 / _target_fps
+            _low_quality = 50  # Lower JPEG quality for faster streaming
+            _medium_quality = 65  # Fallback if frames too large
+            _last_frame_time = time.time()
+            _skipped = 0
+
             while True:
                 frame_obj = cam.read(timeout=0.1)
                 if frame_obj is None:
-                    await asyncio.sleep(0.05)
+                    now = time.time()
+                    if now - _last_no_signal >= _NO_SIGNAL_INTERVAL:
+                        # Generate "No signal" placeholder once and reuse
+                        if _no_signal_jpeg is None:
+                            placeholder = np.zeros((360, 640, 3), dtype=np.uint8)
+                            cv2.putText(
+                                placeholder, "No signal", (220, 195),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (100, 110, 130), 2,
+                            )
+                            _, _buf = cv2.imencode(".jpg", placeholder,
+                                                   [int(cv2.IMWRITE_JPEG_QUALITY), 45])
+                            _no_signal_jpeg = _buf.tobytes()
+                        yield boundary + header + _no_signal_jpeg + b"\r\n"
+                        _last_no_signal = now
+                    await asyncio.sleep(0.02)
                     continue
 
+                _no_signal_jpeg = None   # reset so fresh placeholder generates next gap
+                # ── Adaptive JPEG quality based on frame size ──
+                now_time = time.time()
+                time_since_last = now_time - _last_frame_time
+                
+                # Skip frame if we're ahead of schedule (adaptive frame dropping)
+                if _skipped < 2 and time_since_last < _frame_interval * 0.9:
+                    _skipped += 1
+                    continue
+                _skipped = 0
+                
+                # Use lower quality for faster compression
                 ret, jpeg = cv2.imencode(
                     ".jpg", frame_obj.frame,
-                    [int(cv2.IMWRITE_JPEG_QUALITY), 75],
+                    [int(cv2.IMWRITE_JPEG_QUALITY), _low_quality],
                 )
                 if not ret:
                     continue
+                
+                jpeg_bytes = jpeg.tobytes()
+                # If frame too large (>200KB), re-encode with lower quality
+                if len(jpeg_bytes) > 200000:
+                    ret, jpeg = cv2.imencode(
+                        ".jpg", frame_obj.frame,
+                        [int(cv2.IMWRITE_JPEG_QUALITY), _low_quality - 10],
+                    )
+                    if ret:
+                        jpeg_bytes = jpeg.tobytes()
 
-                yield boundary + header + jpeg.tobytes() + b"\r\n"
-                await asyncio.sleep(1 / 25)   # cap at 25 fps for streaming
+                yield boundary + header + jpeg_bytes + b"\r\n"
+                _last_frame_time = now_time
+                await asyncio.sleep(_frame_interval * 0.7)  # Reduced sleep for pipelining
 
         return StreamingResponse(
             frame_generator(),

@@ -1,0 +1,102 @@
+# config_optimized_desktop.yaml
+# Optimized for desktop systems with good CPU/GPU
+# Use this for smooth, high-quality camera feed
+
+alarm:
+  cooldown_seconds: 5
+  enabled: true
+  output: both
+  sound: beep
+  voice_text: get out,please
+alerts:
+  unknown_person: true
+  webhook_url: ''
+api:
+  host: 0.0.0.0
+  port: 8000
+  workers: 1
+attendance:
+  confidence_threshold: 0.6
+  reports_dir: reports
+  shift_end: null
+  shift_start: null
+cameras:
+- fps: 30                          # High FPS for smooth video
+  id: FaceRecognitionsystem
+  name: Main Entrance
+  rtsp_transport: tcp
+  source: rtsp://admin:Synergy2026@192.168.1.64:554/Streaming/Channels/101
+dashboard:
+  enabled: true
+  host: 0.0.0.0
+  port: 8080
+database:
+  postgresql:
+    host: localhost
+    name: face_recognition
+    password: ''
+    port: 5432
+    user: postgres
+  sqlite:
+    path: data/employees.db
+  type: sqlite
+detection:
+  backend: insightface
+  det_thresh: 0.6
+  insightface_det_size:
+  - 640
+  - 640
+  insightface_model: buffalo_l
+  insightface_root: data/models/insightface
+  min_face_size: 20
+  nms_thresh: 0.4
+  sface_model: data/models/face_recognition_sface_2021dec.onnx
+  yunet_model: data/models/face_detection_yunet_2023mar.onnx
+greeting:
+  camera_channel: 1
+  camera_host: 192.168.1.64
+  camera_password: Synergy2026
+  camera_user: admin
+  cooldown_seconds: 0
+  enabled: true
+  output: both
+  template: Hi, {name}
+  tts_engine: edge
+  vip_template: Welcome, {name}. Please proceed to the reception.
+  voice_index: 1
+  voice_name: en-US-AriaNeural
+  voice_rate: 160
+  voice_volume: 0.9
+logging:
+  backup_count: 5
+  file: logs/recognition.log
+  frames_dir: logs/frames
+  level: INFO
+  log_unknown_frames: true
+  max_size_mb: 100
+performance:
+  batch_size: 8              # Higher batch size for better throughput
+  display_results: true
+  frame_skip: 1              # No frame skipping - process every frame
+  num_threads: 4             # Use more threads
+  use_gpu: false
+  adaptive_fps: true         # Enable adaptive FPS
+  render_buffer_size: 6      # More frames in buffer
+  jpeg_quality: 60           # Good balance between quality and speed
+recognition:
+  embedding_dim: 512
+  threshold: 0.6
+redis:
+  cache_ttl: 300
+  db: 0
+  enabled: false
+  host: localhost
+  port: 6379
+system:
+  debug: false
+  name: Employee Face Recognition System
+  version: 1.0.0
+tracking:
+  cooldown_seconds: 30
+  enabled: true
+  max_distance: 80

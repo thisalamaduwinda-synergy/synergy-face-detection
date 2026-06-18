@@ -61,7 +61,7 @@ class CameraStream:
         camera_id: str,
         source,                     # str (URL) or int (webcam index)
         fps: int = 25,
-        buffer_size: int = 2,
+        buffer_size: int = 4,       # Increased from 2 to reduce lag
         reconnect_delay: int = 5,
         frame_skip: int = 1,        # process every Nth frame
         motion_detection: bool = False,
@@ -198,8 +198,8 @@ class CameraStream:
                 "|flags;low_delay"
                 "|max_delay;0"
                 "|reorder_queue_size;0"
-                "|probesize;32"
-                "|analyzeduration;0"
+                "|probesize;32768"
+                "|analyzeduration;1000000"
             )
             for backend in (cv2.CAP_FFMPEG, cv2.CAP_ANY):
                 cap = cv2.VideoCapture(candidate, backend)

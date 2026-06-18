@@ -46,11 +46,13 @@ class Employee(Base):
     employee_id = Column(String(64), unique=True, nullable=False, index=True)
     name = Column(String(128), nullable=False)
     department = Column(String(128), default="")
+    company_id = Column(String(64), default="", index=True)
     photo_path = Column(String(512), default="")
     # 512-d float32 embedding stored as raw bytes (2048 B per employee)
     face_embedding = Column(LargeBinary, nullable=True)
     registered_at = Column(DateTime, default=datetime.now)
     is_active = Column(Boolean, default=True)
+    is_vip = Column(Boolean, default=False)
 
     def to_dict(self, include_embedding: bool = False) -> Dict:
         data = {
@@ -58,15 +60,53 @@ class Employee(Base):
             "employee_id": self.employee_id,
             "name": self.name,
             "department": self.department,
+            "company_id": self.company_id,
             "photo_path": self.photo_path,
             "registered_at": self.registered_at.isoformat() if self.registered_at else None,
             "is_active": self.is_active,
+            "is_vip": bool(self.is_vip),
             "has_embedding": self.face_embedding is not None,
         }
         if include_embedding and self.face_embedding is not None:
             emb = np.frombuffer(self.face_embedding, dtype=np.float32).copy()
             data["face_embedding"] = emb
         return data
+
+
+class VIPVisitLog(Base):
+    __tablename__ = "vip_visit_logs"
+    __table_args__ = (
+        UniqueConstraint("employee_id", "date", name="uq_vip_visit_per_day"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    employee_id = Column(String(64), nullable=False, index=True)
+    employee_name = Column(String(128), nullable=False)
+    department = Column(String(128), default="")
+    company_id = Column(String(64), default="", index=True)
+    date = Column(Date, nullable=False, index=True)
+    in_time = Column(DateTime, nullable=False)
+    out_time = Column(DateTime, nullable=False)
+    camera_id = Column(String(64), nullable=False)
+    confidence = Column(Float, nullable=False)
+
+    def to_dict(self) -> Dict:
+        duration: Optional[int] = None
+        if self.in_time and self.out_time:
+            duration = int((self.out_time - self.in_time).total_seconds() / 60)
+        return {
+            "id": self.id,
+            "employee_id": self.employee_id,
+            "employee_name": self.employee_name,
+            "department": self.department,
+            "company_id": self.company_id,
+            "date": self.date.isoformat() if self.date else None,
+            "in_time": self.in_time.isoformat() if self.in_time else None,
+            "out_time": self.out_time.isoformat() if self.out_time else None,
+            "camera_id": self.camera_id,
+            "confidence": self.confidence,
+            "visit_duration_minutes": duration,
+        }
 
 
 class DetectionLog(Base):
@@ -182,15 +222,19 @@ class EmployeeDatabase:
 
     def _run_migrations(self) -> None:
         """Add columns introduced after initial release to existing databases."""
+        migrations = [
+            ("attendance_logs", "ALTER TABLE attendance_logs ADD COLUMN is_late BOOLEAN DEFAULT 0"),
+            ("employees", "ALTER TABLE employees ADD COLUMN is_vip BOOLEAN DEFAULT 0"),
+            ("employees", "ALTER TABLE employees ADD COLUMN company_id VARCHAR(64) DEFAULT ''"),
+        ]
         with self._engine.connect() as conn:
-            try:
-                conn.execute(text(
-                    "ALTER TABLE attendance_logs ADD COLUMN is_late BOOLEAN DEFAULT 0"
-                ))
-                conn.commit()
-                logger.info("Migration: added is_late column to attendance_logs")
-            except Exception:
-                pass  # column already exists
+            for table, sql in migrations:
+                try:
+                    conn.execute(text(sql))
+                    conn.commit()
+                    logger.info("Migration applied: %s", sql[:60])
+                except Exception:
+                    pass  # column already exists
 
     def _session(self) -> Session:
         if self._Session is None:
@@ -548,6 +592,93 @@ class EmployeeDatabase:
             })
 
         return sorted(summary, key=lambda x: (x["department"], x["name"]))
+
+    # ── VIP Visit Tracking ──────────────────────────────────
+
+    def mark_vip_visit(
+        self,
+        employee_id: str,
+        employee_name: str,
+        camera_id: str,
+        confidence: float,
+        department: str = "",
+        company_id: str = "",
+        timestamp: Optional[datetime] = None,
+    ) -> bool:
+        """Record VIP in/out times. Returns True if this is the first visit today (IN event)."""
+        now = timestamp or datetime.now()
+        today = now.date()
+
+        with self._session() as session:
+            existing = (
+                session.query(VIPVisitLog)
+                .filter_by(employee_id=employee_id, date=today)
+                .first()
+            )
+            if existing:
+                existing.out_time = now
+                if confidence > existing.confidence:
+                    existing.confidence = round(confidence, 4)
+                session.commit()
+                return False
+
+            entry = VIPVisitLog(
+                employee_id=employee_id,
+                employee_name=employee_name,
+                department=department,
+                company_id=company_id,
+                date=today,
+                in_time=now,
+                out_time=now,
+                camera_id=camera_id,
+                confidence=round(confidence, 4),
+            )
+            session.add(entry)
+            session.commit()
+            logger.info("VIP visit IN: %s (%s)", employee_name, employee_id)
+            return True
+
+    def get_vip_visits(
+        self,
+        target_date: Optional[date] = None,
+        company_id: Optional[str] = None,
+    ) -> List[Dict]:
+        """Return VIP visit records for a given date (defaults to today)."""
+        target_date = target_date or datetime.now().date()
+        with self._session() as session:
+            q = session.query(VIPVisitLog).filter_by(date=target_date)
+            if company_id:
+                q = q.filter_by(company_id=company_id)
+            rows = q.order_by(VIPVisitLog.in_time).all()
+            return [r.to_dict() for r in rows]
+
+    def get_vip_visits_range(
+        self,
+        start: date,
+        end: date,
+        employee_id: Optional[str] = None,
+    ) -> List[Dict]:
+        """Return VIP visit records between start and end dates (inclusive)."""
+        with self._session() as session:
+            q = session.query(VIPVisitLog).filter(
+                VIPVisitLog.date >= start,
+                VIPVisitLog.date <= end,
+            )
+            if employee_id:
+                q = q.filter_by(employee_id=employee_id)
+            rows = q.order_by(VIPVisitLog.date, VIPVisitLog.in_time).all()
+            return [r.to_dict() for r in rows]
+
+    def set_vip_status(self, employee_id: str, is_vip: bool) -> bool:
+        """Set or clear VIP flag for an employee."""
+        with self._session() as session:
+            emp = session.query(Employee).filter_by(employee_id=employee_id).first()
+            if emp is None:
+                return False
+            emp.is_vip = is_vip
+            session.commit()
+            logger.info("VIP status set to %s for %s", is_vip, employee_id)
+            return True
 
     @classmethod
     def from_config(cls, cfg: Dict) -> "EmployeeDatabase":

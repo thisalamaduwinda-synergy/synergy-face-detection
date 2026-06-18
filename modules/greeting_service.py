@@ -62,6 +62,7 @@ class GreetingService:
 
         self.enabled:         bool  = bool(greet_cfg.get("enabled", False))
         self.template:        str   = greet_cfg.get("template", "Hi, {name}")
+        self.vip_template:    str   = greet_cfg.get("vip_template", "Welcome, {name}")
         self.cooldown:        float = float(greet_cfg.get("cooldown_seconds", 60.0))
         self.output:          str   = greet_cfg.get("output", "local").lower()
         self.tts_engine:      str   = greet_cfg.get("tts_engine", "pyttsx3").lower()
@@ -113,7 +114,7 @@ class GreetingService:
 
     # ── Public API ───────────────────────────────────────────
 
-    def greet(self, employee_id: str, employee_name: str) -> bool:
+    def greet(self, employee_id: str, employee_name: str, is_vip: bool = False) -> bool:
         if not self.enabled:
             return False
 
@@ -124,7 +125,8 @@ class GreetingService:
                 return False
             self._last_greeted[employee_id] = now
 
-        text = self.template.format(name=employee_name)
+        template = self.vip_template if is_vip else self.template
+        text = template.format(name=employee_name)
         try:
             self._queue.put_nowait(text)
             logger.debug("Greeting queued: %s", text)
@@ -136,22 +138,58 @@ class GreetingService:
     # ── Background audio loop ────────────────────────────────
 
     def _audio_loop(self) -> None:
-        if self.output == "local" and self.tts_engine == "edge":
+        if self.tts_engine == "edge":
             self._audio_loop_edge()
         else:
             self._audio_loop_pyttsx3()
 
     def _audio_loop_edge(self) -> None:
-        """Audio loop using edge-tts neural voices + pygame playback."""
-        try:
-            import pygame
-            pygame.mixer.pre_init(frequency=24000, size=-16, channels=1, buffer=1024)
-            pygame.mixer.init()
-            logger.info("GreetingService edge-tts ready (voice=%s)", self.voice_name)
-        except Exception as exc:
-            logger.error("pygame init failed: %s — falling back to pyttsx3", exc)
+        """
+        Audio loop using edge-tts neural voices.
+
+        output: local  → edge-tts MP3 → pygame (local speakers)
+        output: both   → edge-tts MP3 → pygame (local) + pyttsx3 → camera ISAPI
+        output: camera → pyttsx3 → camera ISAPI  (edge-tts MP3 cannot be pushed directly)
+        """
+        # ── Init pygame for local playback ───────────────────
+        pygame_ok = False
+        if self.output in ("local", "both"):
+            try:
+                import pygame
+                pygame.mixer.pre_init(frequency=24000, size=-16, channels=1, buffer=1024)
+                pygame.mixer.init()
+                pygame_ok = True
+                logger.info("GreetingService edge-tts ready (voice=%s, output=%s)",
+                            self.voice_name, self.output)
+            except Exception as exc:
+                logger.error("pygame init failed: %s", exc)
+
+        if not pygame_ok:
+            logger.warning("pygame unavailable — falling back to pyttsx3 (output=%s)", self.output)
             self._audio_loop_pyttsx3()
             return
+
+        # ── Init pyttsx3 for camera push (both / camera mode) ─
+        cam_engine = None
+        pyttsx3_mod = None
+        if self.output in ("camera", "both") and self.cam_host:
+            try:
+                import pythoncom
+                pythoncom.CoInitialize()
+            except ImportError:
+                pass
+            try:
+                import pyttsx3 as _pyttsx3
+                pyttsx3_mod = _pyttsx3
+                cam_engine = _pyttsx3.init()
+                cam_engine.setProperty("rate",   self.voice_rate)
+                cam_engine.setProperty("volume", self.voice_volume)
+                voices: List = cast(List, cam_engine.getProperty("voices") or [])
+                if voices and self.voice_index < len(voices):
+                    cam_engine.setProperty("voice", voices[self.voice_index].id)
+                logger.info("GreetingService camera TTS engine ready")
+            except Exception as exc:
+                logger.warning("Camera TTS engine init failed: %s", exc)
 
         while True:
             try:
@@ -163,20 +201,28 @@ class GreetingService:
                 break
 
             try:
-                self._speak_edge(item)
-                logger.debug("edge-tts spoke: %s", item)
+                # Local speakers — high-quality edge-tts neural voice
+                if pygame_ok and self.output in ("local", "both"):
+                    self._speak_edge(item)
+
+                # Camera speaker — pyttsx3 → WAV → G.711 ISAPI push
+                if cam_engine is not None and pyttsx3_mod is not None \
+                        and self.output in ("camera", "both"):
+                    self._speak_to_camera(cam_engine, item, pyttsx3_mod)
+
             except Exception as exc:
                 logger.warning("edge-tts speak error: %s", exc)
             finally:
                 self._queue.task_done()
 
         try:
+            import pygame
             pygame.mixer.quit()
         except Exception:
             pass
 
     def _speak_edge(self, text: str) -> None:
-        """Generate speech with edge-tts and play via pygame."""
+        """Generate speech with edge-tts and play via pygame (local speakers)."""
         import pygame
         import edge_tts
 
@@ -195,6 +241,7 @@ class GreetingService:
             pygame.mixer.music.play()
             while pygame.mixer.music.get_busy():
                 time.sleep(0.05)
+            logger.debug("edge-tts spoke: %s", text)
         finally:
             if tmp_mp3 and os.path.exists(tmp_mp3):
                 try:
@@ -246,26 +293,13 @@ class GreetingService:
             try:
                 if self.output == "sdk":
                     self._speak_via_sdk(engine, item)
-                elif self.output == "camera":
-                    self._speak_to_camera(engine, item, pyttsx3)
+                elif self.output in ("camera", "both"):
+                    # Push to camera speaker; if it fails fall back to local
+                    cam_ok = self._speak_to_camera(engine, item, pyttsx3)
+                    if not cam_ok or self.output == "both":
+                        self._speak_local(engine, item, pyttsx3)
                 else:
-                    # Re-initialise the engine for every utterance.
-                    # Windows SAPI silently stops responding after the first
-                    # runAndWait() when running in a non-main thread; a fresh
-                    # engine instance per call is the reliable workaround.
-                    try:
-                        engine.stop()
-                    except Exception:
-                        pass
-                    engine = pyttsx3.init()
-                    engine.setProperty("rate",   self.voice_rate)
-                    engine.setProperty("volume", self.voice_volume)
-                    voices: List = cast(List, engine.getProperty("voices") or [])
-                    if voices and self.voice_index < len(voices):
-                        engine.setProperty("voice", voices[self.voice_index].id)
-                    engine.say(item)
-                    engine.runAndWait()
-                    logger.debug("TTS spoke: %s", item)
+                    self._speak_local(engine, item, pyttsx3)
             except Exception as exc:
                 logger.warning("TTS speak error: %s", exc)
             finally:
@@ -343,19 +377,39 @@ class GreetingService:
             logger.error("WAV→PCM conversion error: %s", exc)
             return None
 
+    # ── Local audio playback ─────────────────────────────────
+
+    def _speak_local(self, engine, text: str, pyttsx3_mod) -> None:
+        """Play TTS through local PC speakers via pyttsx3."""
+        try:
+            engine.stop()
+        except Exception:
+            pass
+        try:
+            engine = pyttsx3_mod.init()
+            engine.setProperty("rate",   self.voice_rate)
+            engine.setProperty("volume", self.voice_volume)
+            voices: List = cast(List, engine.getProperty("voices") or [])
+            if voices and self.voice_index < len(voices):
+                engine.setProperty("voice", voices[self.voice_index].id)
+            engine.say(text)
+            engine.runAndWait()
+            logger.debug("TTS local spoke: %s", text)
+        except Exception as exc:
+            logger.warning("Local TTS failed: %s", exc)
+
     # ── Camera audio push (Hikvision ISAPI) ──────────────────
 
-    def _speak_to_camera(self, engine, text: str, pyttsx3_mod) -> None:
+    def _speak_to_camera(self, engine, text: str, pyttsx3_mod) -> bool:
         """
         1. Save TTS to a temp WAV file
         2. Convert PCM → G.711 μ-law (8 kHz mono)
         3. Push to Hikvision camera via ISAPI Two-Way Audio
+        Returns True on success, False on failure.
         """
         if not self.cam_host:
-            logger.warning("camera_host not set — falling back to local speaker")
-            engine.say(text)
-            engine.runAndWait()
-            return
+            logger.warning("camera_host not set — skipping camera audio")
+            return False
 
         tmp_wav = None
         try:
@@ -370,11 +424,15 @@ class GreetingService:
             ulaw_data = self._wav_to_ulaw(tmp_wav)
             if not ulaw_data:
                 logger.error("WAV conversion failed — no audio data")
-                return
+                return False
 
             # ── Step 3: Push to Hikvision camera ─────────────
             self._hikvision_push(ulaw_data)
+            return True
 
+        except Exception as exc:
+            logger.warning("Camera TTS failed: %s", exc)
+            return False
         finally:
             if tmp_wav and os.path.exists(tmp_wav):
                 try:

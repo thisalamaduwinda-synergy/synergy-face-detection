@@ -40,7 +40,7 @@ _XL_RATE_LOW     = "FEE2E2"   # rate < 50 %
 
 CSV_HEADERS = [
     "Employee ID", "Name", "Department", "Date",
-    "First Seen", "Last Seen", "Work Hours", "Status",
+    "IN Time", "OUT Time", "Work Hours", "Status",
     "Camera", "Confidence (%)",
 ]
 
@@ -70,8 +70,8 @@ def build_csv_bytes(records: List[dict]) -> bytes:
             "Name":           r.get("employee_name", ""),
             "Department":     r.get("department", ""),
             "Date":           r.get("date", ""),
-            "First Seen":     first,
-            "Last Seen":      last,
+            "IN Time":        first,
+            "OUT Time":       last,
             "Work Hours":     _fmt_duration(wm) if wm is not None else "",
             "Status":         "Late" if r.get("is_late") else "On Time",
             "Camera":         r.get("camera_id", ""),

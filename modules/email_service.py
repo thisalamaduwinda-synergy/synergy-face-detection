@@ -134,7 +134,7 @@ class EmailService:
             f"<td>{r.get('department','')}</td>"
             f"<td>{(r.get('first_seen') or '')[:19].replace('T',' ')}</td>"
             f"<td>{(r.get('last_seen')  or '')[:19].replace('T',' ')}</td>"
-            f"<td>{'Late' if r.get('is_late') else 'On Time'}</td>"
+            f"<td class=\"{'late' if r.get('is_late') else 'ontime'}\">{'Late' if r.get('is_late') else 'On Time'}</td>"
             f"</tr>"
             for r in records
         )
@@ -180,7 +180,7 @@ class EmailService:
 
   <h3>Present Employees ({present_count})</h3>
   <table>
-    <thead><tr><th>ID</th><th>Name</th><th>Department</th><th>First Seen</th><th>Last Seen</th><th>Status</th></tr></thead>
+    <thead><tr><th>ID</th><th>Name</th><th>Department</th><th>IN Time</th><th>OUT Time</th><th>Status</th></tr></thead>
     <tbody>{present_rows}</tbody>
   </table>
 

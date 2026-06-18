@@ -65,6 +65,7 @@ from modules.face_detector import FaceDetector
 from modules.face_recognizer import FaceRecognizer, FaceTracker
 from modules.camera_stream import CameraStream, Frame
 from modules.attendance_exporter import AttendanceExporter
+from modules.email_service import EmailService
 from modules.greeting_service import GreetingService
 from modules.logging_service import LoggingService
 
@@ -194,7 +195,7 @@ class _FrameHub:
 
     def push(self, cam_id: str, frame: np.ndarray) -> None:
         with self._lock:
-            self._frames[cam_id] = frame.copy()
+            self._frames[cam_id] = frame
 
     def get(self, cam_id: str) -> Optional[np.ndarray]:
         with self._lock:
@@ -274,6 +275,7 @@ def _start_web_server(
     logging_svc: "LoggingService",
     recognizer: "FaceRecognizer",
     detector: "FaceDetector",
+    alarm_svc=None,
 ) -> threading.Thread:
     """Start the FastAPI dashboard in a daemon thread, sharing the Qt pipeline."""
 
@@ -281,15 +283,6 @@ def _start_web_server(
         import asyncio
         try:
             from modules.api_server import create_app
-
-            alarm_svc = None
-            try:
-                from modules.alarm_service import AlarmService
-                alarm_svc = AlarmService(cfg)
-                alarm_svc.start()
-                logging_svc.subscribe(alarm_svc.on_detection_event)
-            except Exception:
-                pass
 
             fastapi_app = create_app(
                 db=db,
@@ -362,10 +355,30 @@ class CameraWorker(QThread):
         self._logging_svc  = logging_svc
         self._greeting_svc = greeting_svc
         self._entry_greet  = _EntryGreetTracker(absence_seconds=300.0)
-        self._running    = False
-        self._frame_lock = threading.Lock()
+        self._running = False
+
+        # Per-camera annotated frame storage
+        self._cams_cfg = cfg.get("cameras") or []
+        _cam_ids = [c.get("id", f"cam_{i}") for i, c in enumerate(self._cams_cfg)]
+        self._cam_annotated: Dict[str, Optional[np.ndarray]] = {cid: None for cid in _cam_ids}
+        self._cam_locks:     Dict[str, threading.Lock]       = {cid: threading.Lock() for cid in _cam_ids}
+        # Raw frame for registration dialog (first camera only)
         self._latest_raw: Optional[np.ndarray] = None
-        self._latest_annotated: Optional[np.ndarray] = None
+        self._raw_lock = threading.Lock()
+        # Backward-compat alias — first camera id
+        self._cam_id   = _cam_ids[0] if _cam_ids else "cam_01"
+        self._frame_lock = self._cam_locks.get(self._cam_id, threading.Lock())
+        # Detection lock — shared detector is not thread-safe for concurrent inference
+        self._detect_lock = threading.Lock()
+        # Latest raw frame per camera — shared between display and detection threads
+        self._cam_latest_raw:  Dict[str, Optional[np.ndarray]] = {cid: None for cid in _cam_ids}
+        self._cam_raw_locks:   Dict[str, threading.Lock]       = {cid: threading.Lock() for cid in _cam_ids}
+        # Cached bbox annotations from last detection pass (written by detect, read by display)
+        self._cam_bboxes:      Dict[str, list]                 = {cid: [] for cid in _cam_ids}
+        self._cam_bbox_locks:  Dict[str, threading.Lock]       = {cid: threading.Lock() for cid in _cam_ids}
+        # Active CameraStream instances (populated in run())
+        self._cam_streams: Dict[str, CameraStream] = {}
+        self._cam: Optional[CameraStream] = None  # backward compat: first stream
 
         det = cfg.get("detection", {})
         rec = cfg.get("recognition", {})
@@ -388,6 +401,7 @@ class CameraWorker(QThread):
             insightface_model = det.get("insightface_model", "buffalo_l"),
             insightface_root = det.get("insightface_root", "data/models/insightface"),
             insightface_det_size = tuple(det.get("insightface_det_size", [640, 640])),
+            use_gpu       = bool(cfg.get("performance", {}).get("use_gpu", False)),
         )
 
         # Dedicated registration detector (isolated from live pipeline state)
@@ -414,10 +428,6 @@ class CameraWorker(QThread):
             cooldown_seconds = float(trk.get("cooldown_seconds", 30)),
         )
 
-        cams = cfg.get("cameras") or []
-        self._cam_id     = cams[0].get("id", "cam_01") if cams else None
-        self._cam_source = cams[0].get("source", None) if cams else None
-        self._cam: Optional[CameraStream] = None
 
     # ── Public API ───────────────────────────────────────────
 
@@ -433,14 +443,18 @@ class CameraWorker(QThread):
         self.status.emit(f"FAISS index rebuilt — {len(employees)} employee(s)")
 
     def get_latest_raw_frame(self) -> Optional[np.ndarray]:
-        """Thread-safe access to the most recent raw camera frame."""
-        with self._frame_lock:
+        """Thread-safe access to the most recent raw frame (first camera)."""
+        with self._raw_lock:
             return self._latest_raw.copy() if self._latest_raw is not None else None
 
-    def get_latest_annotated_frame(self) -> Optional[np.ndarray]:
-        """Thread-safe access to the most recent annotated (recognition overlay) frame."""
-        with self._frame_lock:
-            return self._latest_annotated
+    def get_latest_annotated_frame(self, cam_id: Optional[str] = None) -> Optional[np.ndarray]:
+        """Thread-safe access to the most recent annotated frame for *cam_id* (or first camera)."""
+        target = cam_id or self._cam_id
+        lock = self._cam_locks.get(target)
+        if lock is None:
+            return None
+        with lock:
+            return self._cam_annotated.get(target)
 
     def extract_embedding(self, image: np.ndarray) -> Optional[np.ndarray]:
         """
@@ -471,6 +485,11 @@ class CameraWorker(QThread):
 
     def stop(self) -> None:
         self._running = False
+        for stream in self._cam_streams.values():
+            try:
+                stream.stop()
+            except Exception:
+                pass
 
     # ── QThread.run ──────────────────────────────────────────
 
@@ -485,49 +504,196 @@ class CameraWorker(QThread):
             self.status.emit(f"Model load failed: {exc}")
             return
 
-        # Keep FAISS dimensionality aligned with the active detector backend.
         if self.recognizer.dim != self.detector.EMBEDDING_DIM:
             self.recognizer = FaceRecognizer(
                 threshold=self._recognizer_threshold,
                 embedding_dim=self.detector.EMBEDDING_DIM,
             )
 
-        # Build initial FAISS index
         employees = self.db.get_all_employees_with_embeddings()
         self.recognizer.build_index(employees)
         self.status.emit(f"Models ready — {len(employees)} employee(s) in index")
 
-        # Start camera stream
-        if self._cam_source is None:
-            self.status.emit("No camera configured — use '+ Camera' to add one.")
+        if not self._cams_cfg:
+            self.status.emit("No cameras configured — check config.yaml.")
             return
-        self._cam = CameraStream(
-            camera_id  = self._cam_id,
-            source     = self._cam_source,
-            fps        = 30,
-            frame_skip = self.cfg.get("performance", {}).get("frame_skip", 2),
-        )
-        self._cam.start()
-        self.status.emit("Camera started — recognising faces…")
 
-        fps_count = 0
-        fps_ts    = time.time()
+        frame_skip = int(self.cfg.get("performance", {}).get("frame_skip", 1))
 
-        while self._running:
-            frame_obj = self._cam.read(timeout=0.1)
-            if frame_obj is None:
+        for cam_cfg in self._cams_cfg:
+            cid = cam_cfg.get("id", "cam_01")
+            src = cam_cfg.get("source")
+            if not src:
+                logger.warning("Camera '%s' has no source — skipped.", cid)
                 continue
 
+            stream = CameraStream(
+                camera_id      = cid,
+                source         = src,
+                fps            = int(cam_cfg.get("fps", 25)),
+                frame_skip     = frame_skip,
+                rtsp_transport = cam_cfg.get("rtsp_transport", "udp"),
+                resize_width   = int(cam_cfg.get("resize_width", 0)),
+                resize_height  = int(cam_cfg.get("resize_height", 0)),
+            )
+            stream.start()
+            self._cam_streams[cid] = stream
+
+        if not self._cam_streams:
+            self.status.emit("No cameras could be started — check config.yaml.")
+            return
+
+        self._cam = self._cam_streams.get(self._cam_id)  # backward compat
+        n = len(self._cam_streams)
+        self.status.emit(f"{n} camera{'s' if n != 1 else ''} started — recognising faces…")
+
+        _threads = []
+        for cid, stream in self._cam_streams.items():
+            t_disp = threading.Thread(
+                target=self._cam_loop,
+                args=(cid, stream),
+                daemon=True,
+                name=f"cam-display-{cid}",
+            )
+            t_det = threading.Thread(
+                target=self._detect_loop,
+                args=(cid,),
+                daemon=True,
+                name=f"cam-detect-{cid}",
+            )
+            t_disp.start()
+            t_det.start()
+            _threads.extend([t_disp, t_det])
+
+        for t in _threads:
+            t.join()
+
+    # ── Per-camera processing loop (runs in background thread) ──
+
+    def _cam_loop(self, cam_id: str, cam: CameraStream) -> None:
+        """Display loop — throttled to camera FPS, unblocked by detection.
+        Uses Haar cascade to track face positions in real-time so boxes
+        stay centred on faces even between InsightFace detection cycles."""
+        is_primary = (cam_id == self._cam_id)
+        fps_count  = 0
+        fps_ts     = time.time()
+        _frame_ms  = 1.0 / max(cam.target_fps, 1)
+        _last_t    = 0.0
+        _stale     = 0
+        _MAX_STALE = 8   # frames to keep last box when cascade misses (~0.3 s at 25 fps)
+
+        _cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        )
+
+        while self._running:
+            now = time.time()
+            gap = _frame_ms - (now - _last_t)
+            if gap > 0:
+                time.sleep(gap)
+
+            frame_obj = cam.read_latest(timeout=_frame_ms * 2)
+            if frame_obj is None:
+                continue
+            _last_t = time.time()
+
             raw = frame_obj.frame
+            h, w = raw.shape[:2]
 
-            # Store raw frame for the registration dialog preview
-            with self._frame_lock:
-                self._latest_raw = raw.copy()
+            if is_primary:
+                with self._raw_lock:
+                    self._latest_raw = raw.copy()
 
-            # Detection + embedding
+            with self._cam_raw_locks[cam_id]:
+                self._cam_latest_raw[cam_id] = raw
+
+            with self._cam_bbox_locks[cam_id]:
+                cached = list(self._cam_bboxes[cam_id])
+
             annotated = raw.copy()
+
+            if cached:
+                # Downscale for fast cascade (keep under 640 px wide)
+                scale  = min(1.0, 640.0 / w)
+                small  = cv2.resize(raw, (int(w * scale), int(h * scale))) if scale < 1.0 else raw
+                gray   = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+                cfaces = _cascade.detectMultiScale(
+                    gray, scaleFactor=1.1, minNeighbors=5,
+                    minSize=(max(30, int(40 * scale)), max(30, int(40 * scale))),
+                )
+
+                if len(cfaces) > 0:
+                    _stale = 0
+                    for (cx, cy, cw, ch) in cfaces:
+                        if scale < 1.0:
+                            cx = int(cx / scale); cy = int(cy / scale)
+                            cw = int(cw / scale); ch = int(ch / scale)
+                        nx1, ny1, nx2, ny2 = cx, cy, cx + cw, cy + ch
+                        fc_x = cx + cw // 2
+                        fc_y = cy + ch // 2
+
+                        # Match to nearest cached InsightFace identity
+                        best_lbl  = "Unknown"
+                        best_col  = (50, 50, 220)
+                        best_dist = float("inf")
+                        for (ox1, oy1, ox2, oy2), lbl, col in cached:
+                            d = ((fc_x - (ox1 + ox2) // 2) ** 2 +
+                                 (fc_y - (oy1 + oy2) // 2) ** 2) ** 0.5
+                            if d < best_dist:
+                                best_dist, best_lbl, best_col = d, lbl, col
+
+                        if best_dist < max(w, h) * 0.4:
+                            cv2.rectangle(annotated, (nx1, ny1), (nx2, ny2), best_col, 2)
+                            cv2.rectangle(annotated, (nx1, ny1 - 26), (nx2, ny1),
+                                          best_col, cv2.FILLED)
+                            cv2.putText(annotated, best_lbl, (nx1 + 4, ny1 - 6),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.56,
+                                        (255, 255, 255), 1, cv2.LINE_AA)
+                else:
+                    _stale += 1
+                    if _stale < _MAX_STALE:
+                        for (x1, y1, x2, y2), lbl, col in cached:
+                            cv2.rectangle(annotated, (x1, y1), (x2, y2), col, 2)
+                            cv2.rectangle(annotated, (x1, y1 - 26), (x2, y1),
+                                          col, cv2.FILLED)
+                            cv2.putText(annotated, lbl, (x1 + 4, y1 - 6),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.56,
+                                        (255, 255, 255), 1, cv2.LINE_AA)
+
+            with self._cam_locks[cam_id]:
+                self._cam_annotated[cam_id] = annotated
+            if self._frame_hub is not None:
+                self._frame_hub.push(cam_id, annotated)
+
+            fps_count += 1
+            now = time.time()
+            if now - fps_ts >= 1.0:
+                self.fps_update.emit(fps_count / (now - fps_ts))
+                fps_count = 0
+                fps_ts    = now
+
+        self.status.emit("Camera stopped.")
+
+    def _detect_loop(self, cam_id: str) -> None:
+        """Detection loop — runs independently, heavy work never touches the display."""
+        _MIN_INTERVAL = 0.10
+
+        while self._running:
+            # Grab latest raw frame
+            with self._cam_raw_locks[cam_id]:
+                src = self._cam_latest_raw.get(cam_id)
+            if src is None:
+                time.sleep(0.05)
+                continue
+
+            raw = src.copy()           # own copy so display thread is free
+            detect_annotated = raw.copy()
+            new_boxes: list = []
+
             try:
-                faces = self.detector.detect(raw)
+                with self._detect_lock:
+                    faces = self.detector.detect(raw)
+
                 for face in faces:
                     if face.embedding is None:
                         continue
@@ -535,10 +701,6 @@ class CameraWorker(QThread):
                     result = self.recognizer.recognize(face.embedding)
                     result.bbox = face.bbox
 
-                    # Voice greeting — fires on fresh entry, independent of logging cooldown.
-                    # Use result.name as the tracker key — employee_id can fall back to
-                    # the shared sentinel "UNKNOWN" when the DB field is missing, which
-                    # would cause all employees to share one cooldown slot.
                     logger.debug(
                         "[GREET-CHECK] name=%s is_known=%s conf=%.2f",
                         result.name, result.is_known, result.confidence,
@@ -551,28 +713,41 @@ class CameraWorker(QThread):
                                 self._greeting_svc.greet(
                                     employee_id   = _greet_key,
                                     employee_name = result.name,
+                                    is_vip        = result.is_vip,
                                 )
-                            except Exception:
-                                pass
+                            except Exception as _ge:
+                                logger.warning("[GREET] greet() error: %s", _ge)
 
                     cx, cy = face.center
+
+                    if result.is_known and result.is_vip and result.confidence >= self._attendance_threshold:
+                        try:
+                            self.db.mark_vip_visit(
+                                employee_id   = result.employee_id,
+                                employee_name = result.name,
+                                camera_id     = cam_id,
+                                confidence    = result.confidence,
+                                department    = result.department,
+                                company_id    = result.company_id,
+                            )
+                        except Exception:
+                            pass
+
                     if self.tracker.should_log(result, (cx, cy)):
-                        # Log via LoggingService (→ DB + WebSocket broadcast)
-                        # or fall back to direct DB write if no service is wired up.
                         try:
                             if self._logging_svc is not None:
                                 self._logging_svc.log_detection(
-                                    camera_id     = self._cam_id,
+                                    camera_id     = cam_id,
                                     employee_id   = result.employee_id if result.is_known else None,
                                     employee_name = result.name,
                                     confidence    = result.confidence,
                                     is_known      = result.is_known,
                                     bbox          = list(face.bbox),
-                                    frame         = annotated if not result.is_known else None,
+                                    frame         = detect_annotated if not result.is_known else None,
                                 )
                             else:
                                 self.db.log_detection(
-                                    camera_id     = self._cam_id,
+                                    camera_id     = cam_id,
                                     employee_id   = result.employee_id if result.is_known else None,
                                     employee_name = result.name,
                                     confidence    = result.confidence,
@@ -582,13 +757,12 @@ class CameraWorker(QThread):
                         except Exception:
                             pass
 
-                        # Mark attendance when confidence is high enough
-                        if result.is_known and result.confidence >= self._attendance_threshold:
+                        if result.is_known and not result.is_vip and result.confidence >= self._attendance_threshold:
                             try:
                                 self.db.mark_attendance(
                                     employee_id   = result.employee_id,
                                     employee_name = result.name,
-                                    camera_id     = self._cam_id,
+                                    camera_id     = cam_id,
                                     confidence    = result.confidence,
                                     department    = result.department,
                                     shift_start   = self._shift_start,
@@ -603,40 +777,28 @@ class CameraWorker(QThread):
                             "employee_id": result.employee_id,
                             "confidence":  result.confidence,
                             "is_known":    result.is_known,
-                            "camera_id":   self._cam_id,
+                            "is_vip":      result.is_vip,
+                            "camera_id":   cam_id,
                         })
 
-                    # Draw bounding box + label
                     x1, y1, x2, y2 = face.bbox
                     box_color = (40, 220, 80) if result.is_known else (50, 50, 220)
-                    cv2.rectangle(annotated, (x1, y1), (x2, y2), box_color, 2)
                     label = f"{result.name}  {result.confidence:.0%}"
-                    cv2.rectangle(annotated, (x1, y1 - 26), (x2, y1), box_color, cv2.FILLED)
-                    cv2.putText(annotated, label, (x1 + 4, y1 - 6),
+                    cv2.rectangle(detect_annotated, (x1, y1), (x2, y2), box_color, 2)
+                    cv2.rectangle(detect_annotated, (x1, y1 - 26), (x2, y1), box_color, cv2.FILLED)
+                    cv2.putText(detect_annotated, label, (x1 + 4, y1 - 6),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.56,
                                 (255, 255, 255), 1, cv2.LINE_AA)
+                    new_boxes.append(((x1, y1, x2, y2), label, box_color))
 
             except Exception as exc:
-                logger.exception("Frame processing error: %s", exc)
+                logger.exception("[%s] Detection error: %s", cam_id, exc)
 
-            with self._frame_lock:
-                self._latest_annotated = annotated
+            with self._cam_bbox_locks[cam_id]:
+                self._cam_bboxes[cam_id] = new_boxes
 
-            # Push annotated frame to web bridge (non-blocking)
-            if self._frame_hub is not None and self._cam_id is not None:
-                self._frame_hub.push(self._cam_id, annotated)
-
-            # FPS counter
-            fps_count += 1
-            now = time.time()
-            if now - fps_ts >= 1.0:
-                self.fps_update.emit(fps_count / (now - fps_ts))
-                fps_count = 0
-                fps_ts    = now
-
-        if self._cam:
-            self._cam.stop()
-        self.status.emit("Camera stopped.")
+            # Brief pause before next detection cycle
+            time.sleep(_MIN_INTERVAL)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -699,6 +861,8 @@ class StatsBar(QWidget):
 # ─────────────────────────────────────────────────────────────
 
 class VideoDisplay(QLabel):
+    """Video display widget — must be updated from the main thread."""
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -714,8 +878,12 @@ class VideoDisplay(QLabel):
         self.setText("◉  Waiting for camera…")
 
     def update_frame(self, frame: np.ndarray) -> None:
+        """Render a BGR frame. Must be called from the main (GUI) thread."""
+        w, h = self.width(), self.height()
+        if w < 100 or h < 100:
+            return
         pix = bgr_to_pixmap(frame).scaled(
-            self.width(), self.height(),
+            w, h,
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.FastTransformation,
         )
@@ -783,10 +951,10 @@ class _EmployeeCard(QFrame):
         del_btn.clicked.connect(lambda: self.delete_clicked.emit(self._emp_id))
         row.addWidget(del_btn)
 
-    def mousePressEvent(self, event) -> None:
-        if event.button() == Qt.MouseButton.LeftButton:
+    def mousePressEvent(self, a0) -> None:
+        if a0 and a0.button() == Qt.MouseButton.LeftButton:
             self.card_clicked.emit(self._emp_id)
-        super().mousePressEvent(event)
+        super().mousePressEvent(a0)
 
 
 class EmployeePanel(QWidget):
@@ -847,8 +1015,10 @@ class EmployeePanel(QWidget):
         # Remove all cards but keep the trailing stretch
         while self._cards_lay.count() > 1:
             item = self._cards_lay.takeAt(0)
+            if item is None:
+                break
             w = item.widget()
-            if w:
+            if w is not None:
                 w.deleteLater()
 
         for emp in employees:
@@ -944,8 +1114,10 @@ class LogPanel(QWidget):
         while self._entry_count > self._MAX:
             # The stretch is at count()-1; oldest entries accumulate just before it
             item = self._log_lay.takeAt(self._log_lay.count() - 2)
-            if item and item.widget():
-                item.widget().deleteLater()
+            if item is not None:
+                w = item.widget()
+                if w is not None:
+                    w.deleteLater()
             self._entry_count -= 1
 
 
@@ -1115,9 +1287,9 @@ class UnknownPersonsPanel(QWidget):
         """Schedule a refresh — rapid back-to-back calls are coalesced."""
         self._debounce.start()   # restarts the 700 ms window each time
 
-    def showEvent(self, event) -> None:
+    def showEvent(self, a0) -> None:
         """Refresh immediately whenever the tab becomes visible."""
-        super().showEvent(event)
+        super().showEvent(a0)
         self._do_refresh()
 
     # ── Internal ─────────────────────────────────────────────
@@ -1157,8 +1329,10 @@ class UnknownPersonsPanel(QWidget):
         """Rebuild grid layout using cached pixmaps — no disk I/O."""
         while self._grid.count():
             item = self._grid.takeAt(0)
-            if item and item.widget():
-                item.widget().deleteLater()
+            if item is not None:
+                w = item.widget()
+                if w is not None:
+                    w.deleteLater()
         self._shown.clear()
         self._cards.clear()
 
@@ -1210,8 +1384,10 @@ class UnknownPersonsPanel(QWidget):
                 pass
         while self._grid.count():
             item = self._grid.takeAt(0)
-            if item and item.widget():
-                item.widget().deleteLater()
+            if item is not None:
+                w = item.widget()
+                if w is not None:
+                    w.deleteLater()
         self._shown.clear()
         self._cards.clear()
         self._count_lbl.setText("0 captures")
@@ -1427,9 +1603,9 @@ class AddEmployeeDialog(QDialog):
         self.worker.rebuild_index()
         self.accept()
 
-    def closeEvent(self, event) -> None:
+    def closeEvent(self, a0) -> None:
         self._preview_timer.stop()
-        super().closeEvent(event)
+        super().closeEvent(a0)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1536,6 +1712,395 @@ class EmployeeDetailDialog(QDialog):
 
 
 # ─────────────────────────────────────────────────────────────
+# VIP Staff Panel
+# ─────────────────────────────────────────────────────────────
+
+C_GOLD = "#f59e0b"   # amber/gold for VIP accents
+
+
+class _VIPEmployeeCard(QFrame):
+    """Single VIP employee card with Remove-VIP button."""
+    remove_vip = pyqtSignal(str)   # employee_id
+
+    def __init__(self, emp: Dict, parent=None) -> None:
+        super().__init__(parent)
+        self._emp_id = emp["employee_id"]
+        self.setStyleSheet(f"""
+            _VIPEmployeeCard {{
+                background: {C_CARD}; border-radius: 8px;
+                border: 1px solid {C_GOLD};
+            }}
+        """)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(10, 8, 10, 8)
+        row.setSpacing(10)
+
+        # Gold star avatar
+        av = QLabel("⭐")
+        av.setFixedSize(QSize(36, 36))
+        av.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        av.setStyleSheet(f"""
+            background: {C_GOLD}; border-radius: 18px;
+            color: #fff; font-size: 16px;
+        """)
+        row.addWidget(av)
+
+        # Name + meta
+        info = QVBoxLayout()
+        info.setSpacing(1)
+        nm = QLabel(emp["name"])
+        nm.setStyleSheet(f"color: {C_TEXT}; font-weight: 600; font-size: 13px;")
+        meta = f"{emp['employee_id']}  ·  {emp.get('department') or '—'}"
+        if emp.get("company_id"):
+            meta += f"  ·  {emp['company_id']}"
+        mt = QLabel(meta)
+        mt.setStyleSheet(f"color: {C_MUTED}; font-size: 11px;")
+        info.addWidget(nm)
+        info.addWidget(mt)
+        row.addLayout(info, stretch=1)
+
+        rem_btn = QToolButton()
+        rem_btn.setText("Remove VIP")
+        rem_btn.setFixedHeight(24)
+        rem_btn.setStyleSheet(f"""
+            QToolButton {{
+                background: {C_CARD}; color: {C_AMBER};
+                border: 1px solid {C_AMBER}; border-radius: 4px;
+                font-size: 10px; padding: 0 6px;
+            }}
+            QToolButton:hover {{ background: {C_AMBER}; color: #000; }}
+        """)
+        rem_btn.clicked.connect(lambda: self.remove_vip.emit(self._emp_id))
+        row.addWidget(rem_btn)
+
+
+class _VIPVisitRow(QFrame):
+    """Single row showing VIP in/out times."""
+
+    def __init__(self, visit: Dict, parent=None) -> None:
+        super().__init__(parent)
+        self.setStyleSheet(f"""
+            _VIPVisitRow {{
+                background: {C_CARD}; border-radius: 6px;
+                border-left: 3px solid {C_GOLD};
+            }}
+        """)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(10, 6, 10, 6)
+        row.setSpacing(12)
+
+        name_lbl = QLabel(visit.get("employee_name", ""))
+        name_lbl.setStyleSheet(
+            f"color: {C_TEXT}; font-weight: 600; font-size: 12px;")
+        name_lbl.setFixedWidth(130)
+        row.addWidget(name_lbl)
+
+        in_t  = visit.get("in_time", "")[-8:] if visit.get("in_time") else "—"
+        out_t = visit.get("out_time", "")[-8:] if visit.get("out_time") else "—"
+        dur   = visit.get("visit_duration_minutes")
+        dur_s = f"{dur} min" if dur is not None else "—"
+
+        for label, val, color in [
+            ("IN",  in_t,  C_GREEN),
+            ("OUT", out_t, C_RED),
+            ("Duration", dur_s, C_MUTED),
+        ]:
+            col = QVBoxLayout()
+            col.setSpacing(0)
+            v_lbl = QLabel(val)
+            v_lbl.setStyleSheet(f"color: {color}; font-size: 12px; font-weight: 600;")
+            t_lbl = QLabel(label)
+            t_lbl.setStyleSheet(f"color: {C_MUTED}; font-size: 9px;")
+            col.addWidget(v_lbl)
+            col.addWidget(t_lbl)
+            row.addLayout(col)
+
+        row.addStretch()
+
+        dept = visit.get("department", "")
+        if dept:
+            dept_lbl = QLabel(dept)
+            dept_lbl.setStyleSheet(f"color: {C_MUTED}; font-size: 10px;")
+            dept_lbl.setAlignment(Qt.AlignmentFlag.AlignRight |
+                                   Qt.AlignmentFlag.AlignVCenter)
+            row.addWidget(dept_lbl)
+
+
+class VIPPanel(QWidget):
+    """
+    Two-column panel:
+      Left  — registered VIP staff list (with Remove VIP + Add VIP)
+      Right — today's VIP visit log (in/out times, auto-refreshed)
+    """
+
+    vip_changed = pyqtSignal()   # emitted whenever VIP status changes → triggers FAISS rebuild
+
+    def __init__(self, db: EmployeeDatabase, parent=None) -> None:
+        super().__init__(parent)
+        self._db = db
+        self._build_ui()
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(15_000)   # refresh every 15 s
+        self._timer.timeout.connect(self.refresh)
+        self._timer.start()
+
+    # ── UI ───────────────────────────────────────────────────
+
+    def _build_ui(self) -> None:
+        root = QHBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(12)
+
+        # ── Left: VIP employee list ──────────────────────────
+        left = QWidget()
+        left.setFixedWidth(300)
+        left.setStyleSheet(f"background: {C_PANEL}; border-radius: 8px;")
+        llay = QVBoxLayout(left)
+        llay.setContentsMargins(10, 10, 10, 10)
+        llay.setSpacing(8)
+
+        hdr_l = QHBoxLayout()
+        ttl = QLabel("⭐  VIP Staff")
+        ttl.setStyleSheet(
+            f"color: {C_GOLD}; font-size: 15px; font-weight: 700;")
+        self._add_vip_btn = QPushButton("+ Add VIP")
+        self._add_vip_btn.setFixedSize(QSize(80, 28))
+        self._add_vip_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {C_GOLD}; color: #000; border: none;
+                border-radius: 5px; font-size: 12px; font-weight: 600;
+            }}
+            QPushButton:hover {{ background: #fbbf24; }}
+        """)
+        self._add_vip_btn.clicked.connect(self._open_add_vip_dialog)
+        hdr_l.addWidget(ttl)
+        hdr_l.addStretch()
+        hdr_l.addWidget(self._add_vip_btn)
+        llay.addLayout(hdr_l)
+
+        scroll_l = QScrollArea()
+        scroll_l.setWidgetResizable(True)
+        scroll_l.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll_l.setStyleSheet("background: transparent; border: none;")
+
+        self._vip_container = QWidget()
+        self._vip_container.setStyleSheet("background: transparent;")
+        self._vip_lay = QVBoxLayout(self._vip_container)
+        self._vip_lay.setContentsMargins(0, 0, 4, 0)
+        self._vip_lay.setSpacing(6)
+        self._vip_lay.addStretch()
+        scroll_l.setWidget(self._vip_container)
+        llay.addWidget(scroll_l, stretch=1)
+
+        self._vip_count = QLabel("0 VIP staff")
+        self._vip_count.setStyleSheet(f"color: {C_MUTED}; font-size: 11px;")
+        llay.addWidget(self._vip_count)
+        root.addWidget(left)
+
+        # ── Right: Today's VIP visits ────────────────────────
+        right = QWidget()
+        right.setStyleSheet(f"background: {C_PANEL}; border-radius: 8px;")
+        rlay = QVBoxLayout(right)
+        rlay.setContentsMargins(10, 10, 10, 10)
+        rlay.setSpacing(8)
+
+        hdr_r = QHBoxLayout()
+        ttl_r = QLabel("Today's VIP Visits")
+        ttl_r.setStyleSheet(
+            f"color: {C_TEXT}; font-size: 15px; font-weight: 700;")
+        self._date_lbl = QLabel("")
+        self._date_lbl.setStyleSheet(f"color: {C_MUTED}; font-size: 11px;")
+        ref_btn = QPushButton("↻ Refresh")
+        ref_btn.setFixedSize(QSize(80, 28))
+        ref_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {C_CARD}; color: {C_TEXT}; border: 1px solid {C_BORDER};
+                border-radius: 5px; font-size: 12px;
+            }}
+            QPushButton:hover {{ background: {C_BORDER}; }}
+        """)
+        ref_btn.clicked.connect(self.refresh)
+        hdr_r.addWidget(ttl_r)
+        hdr_r.addWidget(self._date_lbl)
+        hdr_r.addStretch()
+        hdr_r.addWidget(ref_btn)
+        rlay.addLayout(hdr_r)
+
+        # Column headers
+        col_hdr = QHBoxLayout()
+        for txt, w in [("Name", 130), ("IN", 70), ("OUT", 70), ("Duration", 80), ("", 0)]:
+            lbl = QLabel(txt)
+            lbl.setStyleSheet(
+                f"color: {C_MUTED}; font-size: 10px; font-weight: 600;")
+            if w:
+                lbl.setFixedWidth(w)
+            col_hdr.addWidget(lbl)
+        col_hdr.addStretch()
+        rlay.addLayout(col_hdr)
+
+        scroll_r = QScrollArea()
+        scroll_r.setWidgetResizable(True)
+        scroll_r.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll_r.setStyleSheet("background: transparent; border: none;")
+
+        self._visit_container = QWidget()
+        self._visit_container.setStyleSheet("background: transparent;")
+        self._visit_lay = QVBoxLayout(self._visit_container)
+        self._visit_lay.setContentsMargins(0, 0, 4, 0)
+        self._visit_lay.setSpacing(5)
+        self._visit_lay.addStretch()
+        scroll_r.setWidget(self._visit_container)
+        rlay.addWidget(scroll_r, stretch=1)
+
+        self._visit_count = QLabel("0 visits today")
+        self._visit_count.setStyleSheet(f"color: {C_MUTED}; font-size: 11px;")
+        rlay.addWidget(self._visit_count)
+        root.addWidget(right, stretch=1)
+
+    # ── Refresh ──────────────────────────────────────────────
+
+    def refresh(self) -> None:
+        self._refresh_vip_list()
+        self._refresh_visits()
+
+    def _refresh_vip_list(self) -> None:
+        while self._vip_lay.count() > 1:
+            item = self._vip_lay.takeAt(0)
+            if item is None:
+                break
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+
+        all_emps = self._db.get_all_employees()
+        vips = [e for e in all_emps if e.get("is_vip")]
+
+        for emp in vips:
+            card = _VIPEmployeeCard(emp)
+            card.remove_vip.connect(self._remove_vip)
+            self._vip_lay.insertWidget(self._vip_lay.count() - 1, card)
+
+        n = len(vips)
+        self._vip_count.setText(f"{n} VIP staff")
+
+    def _refresh_visits(self) -> None:
+        while self._visit_lay.count() > 1:
+            item = self._visit_lay.takeAt(0)
+            if item is None:
+                break
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+
+        from datetime import date as _date
+        today = _date.today()
+        self._date_lbl.setText(str(today))
+        visits = self._db.get_vip_visits(target_date=today)
+
+        for v in visits:
+            row = _VIPVisitRow(v)
+            self._visit_lay.insertWidget(self._visit_lay.count() - 1, row)
+
+        n = len(visits)
+        self._visit_count.setText(f"{n} visit{'s' if n != 1 else ''} today")
+
+    # ── Actions ──────────────────────────────────────────────
+
+    def _open_add_vip_dialog(self) -> None:
+        dlg = _AddVIPDialog(self._db, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.refresh()
+            self.vip_changed.emit()   # trigger FAISS index rebuild
+
+    def _remove_vip(self, emp_id: str) -> None:
+        emp = self._db.get_employee(emp_id)
+        name = emp["name"] if emp else emp_id
+        reply = QMessageBox.question(
+            self, "Remove VIP Status",
+            f"Remove VIP status from '{name}'?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self._db.set_vip_status(emp_id, False)
+            self.refresh()
+            self.vip_changed.emit()   # trigger FAISS index rebuild
+
+
+class _AddVIPDialog(QDialog):
+    """Pick an employee from a list and mark them as VIP."""
+
+    def __init__(self, db: EmployeeDatabase, parent=None) -> None:
+        super().__init__(parent)
+        self._db = db
+        self.setWindowTitle("Add VIP Staff")
+        self.setMinimumWidth(400)
+        self.setStyleSheet(f"background: {C_PANEL}; color: {C_TEXT};")
+
+        lay = QVBoxLayout(self)
+        lay.setSpacing(10)
+        lay.setContentsMargins(16, 16, 16, 16)
+
+        lbl = QLabel("Select employee to mark as VIP:")
+        lbl.setStyleSheet(f"color: {C_TEXT}; font-size: 13px;")
+        lay.addWidget(lbl)
+
+        self._combo = QComboBox()
+        self._combo.setStyleSheet(f"""
+            QComboBox {{
+                background: {C_CARD}; color: {C_TEXT};
+                border: 1px solid {C_BORDER}; border-radius: 6px;
+                padding: 6px 10px; font-size: 13px;
+            }}
+            QComboBox QAbstractItemView {{
+                background: {C_CARD}; color: {C_TEXT};
+                selection-background-color: {C_ACCENT};
+            }}
+        """)
+
+        all_emps = db.get_all_employees()
+        self._emp_ids = []
+        for e in all_emps:
+            if not e.get("is_vip"):
+                label = f"{e['name']}  ({e['employee_id']})"
+                if e.get("department"):
+                    label += f"  —  {e['department']}"
+                self._combo.addItem(label)
+                self._emp_ids.append(e["employee_id"])
+        lay.addWidget(self._combo)
+
+        if not self._emp_ids:
+            info = QLabel("All employees are already VIP.")
+            info.setStyleSheet(f"color: {C_AMBER}; font-size: 12px;")
+            lay.addWidget(info)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok |
+            QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.accepted.connect(self._on_accept)
+        btns.rejected.connect(self.reject)
+        btns.setStyleSheet(f"""
+            QPushButton {{
+                background: {C_ACCENT}; color: #fff; border: none;
+                border-radius: 5px; padding: 6px 16px; font-size: 12px;
+            }}
+            QPushButton:hover {{ background: {C_ACCENT_H}; }}
+        """)
+        lay.addWidget(btns)
+
+    def _on_accept(self) -> None:
+        idx = self._combo.currentIndex()
+        if idx < 0 or idx >= len(self._emp_ids):
+            self.reject()
+            return
+        self._db.set_vip_status(self._emp_ids[idx], True)
+        self.accept()
+
+
+# ─────────────────────────────────────────────────────────────
 # Attendance Dialog
 # ─────────────────────────────────────────────────────────────
 
@@ -1543,7 +2108,7 @@ class AttendanceDialog(QDialog):
     """Date picker + table view + CSV download for daily attendance."""
 
     _COLUMNS = ["Employee ID", "Name", "Department",
-                "First Seen", "Last Seen", "Work Hours", "Status", "Camera", "Confidence"]
+                "IN Time", "OUT Time", "Work Hours", "Status", "Camera", "Confidence"]
 
     def __init__(self, db: EmployeeDatabase, parent=None) -> None:
         super().__init__(parent)
@@ -1628,9 +2193,12 @@ class AttendanceDialog(QDialog):
         # Table
         self._table = QTableWidget(0, len(self._COLUMNS))
         self._table.setHorizontalHeaderLabels(self._COLUMNS)
-        self._table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.Stretch)
-        self._table.verticalHeader().setVisible(False)
+        header = self._table.horizontalHeader()
+        if header is not None:
+            header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        vheader = self._table.verticalHeader()
+        if vheader is not None:
+            vheader.setVisible(False)
         self._table.setEditTriggers(
             QTableWidget.EditTrigger.NoEditTriggers)
         self._table.setSelectionBehavior(
@@ -1699,9 +2267,9 @@ class AttendanceDialog(QDialog):
         n = len(records)
         self._count_lbl.setText(f"{n} record{'s' if n != 1 else ''}")
 
-    def closeEvent(self, event) -> None:
+    def closeEvent(self, a0) -> None:
         self._auto_refresh.stop()
-        super().closeEvent(event)
+        super().closeEvent(a0)
 
     def _download(self) -> None:
         from modules.attendance_exporter import build_csv_bytes
@@ -1879,15 +2447,15 @@ class CameraManagerDialog(QDialog):
 
         self._table = QTableWidget(0, 4)
         self._table.setHorizontalHeaderLabels(["Name", "ID", "Source", "Actions"])
-        self._table.horizontalHeader().setSectionResizeMode(
-            0, QHeaderView.ResizeMode.Stretch)
-        self._table.horizontalHeader().setSectionResizeMode(
-            1, QHeaderView.ResizeMode.ResizeToContents)
-        self._table.horizontalHeader().setSectionResizeMode(
-            2, QHeaderView.ResizeMode.Stretch)
-        self._table.horizontalHeader().setSectionResizeMode(
-            3, QHeaderView.ResizeMode.ResizeToContents)
-        self._table.verticalHeader().setVisible(False)
+        header = self._table.horizontalHeader()
+        if header is not None:
+            header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+            header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+            header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        vheader = self._table.verticalHeader()
+        if vheader is not None:
+            vheader.setVisible(False)
         self._table.setEditTriggers(
             QTableWidget.EditTrigger.NoEditTriggers)
         self._table.setSelectionMode(
@@ -2014,7 +2582,9 @@ class CameraManagerDialog(QDialog):
                 return
             dlg.accept()
             # Refresh table cell
-            self._table.item(row, 0).setText(new_name)
+            item = self._table.item(row, 0)
+            if item is not None:
+                item.setText(new_name)
 
         save.clicked.connect(_do_save)
         edit.returnPressed.connect(_do_save)
@@ -2341,7 +2911,7 @@ class SettingsDialog(QDialog):
             if self._worker.recognizer is not None:
                 self._worker.recognizer.threshold = self._rec_thresh.value()
             if self._worker.tracker is not None:
-                self._worker.tracker.cooldown_seconds = float(self._trk_cool.value())
+                self._worker.tracker.cooldown = float(self._trk_cool.value())
         except Exception:
             pass
 
@@ -2433,15 +3003,27 @@ class MainWindow(QMainWindow):
 
         # ── Attendance auto-export at 11:59 PM ───────────────
         att_cfg = cfg.get("attendance", {})
+        self._email_svc = EmailService(cfg)
         self._attendance_exporter = AttendanceExporter(
             db=self.db,
             reports_dir=att_cfg.get("reports_dir", "reports"),
+            email_service=self._email_svc,
         )
         self._attendance_exporter.start()
 
         # ── Greeting service (voice "Hi <name>") ─────────────
         self._greeting_svc = GreetingService(cfg)
         self._greeting_svc.start()
+
+        # ── Alarm service (unknown person beep/voice) ─────────
+        self._alarm_svc = None
+        try:
+            from modules.alarm_service import AlarmService
+            self._alarm_svc = AlarmService(cfg)
+            self._alarm_svc.start()
+            self._logging_svc.subscribe(self._alarm_svc.on_detection_event)
+        except Exception as exc:
+            logger.warning("AlarmService init failed: %s", exc)
 
         # ── Camera worker ────────────────────────────────────
         self.worker = CameraWorker(cfg, self.db,
@@ -2488,7 +3070,7 @@ class MainWindow(QMainWindow):
         api_port = int(cfg.get("api", {}).get("port", 8000))
         _start_web_server(cfg, self.db, qt_cam_mgr,
                           self._logging_svc, self.worker.recognizer,
-                          self.worker.detector)
+                          self.worker.detector, self._alarm_svc)
         # Show URL in status bar after a short delay (server needs ~1 s to bind)
         QTimer.singleShot(1500, lambda: self._show_web_url(api_port))
 
@@ -2565,11 +3147,42 @@ class MainWindow(QMainWindow):
         self.emp_panel.delete_requested.connect(self._delete_employee)
         self.emp_panel.detail_requested.connect(self._show_detail)
 
-        self.video = VideoDisplay()
+        # ── Per-camera VideoDisplay grid ──────────────────────
+        self._video_displays: Dict[str, VideoDisplay] = {}
+        _cams = self.cfg.get("cameras") or [{}]
+        _cols = 1 if len(_cams) <= 1 else 2
+        _video_container = QWidget()
+        _video_container.setStyleSheet("background: transparent;")
+        _video_grid = QGridLayout(_video_container)
+        _video_grid.setContentsMargins(0, 0, 0, 0)
+        _video_grid.setSpacing(4)
+        for _i, _cam_cfg in enumerate(_cams):
+            _cid   = _cam_cfg.get("id",   f"cam_{_i}")
+            _cname = _cam_cfg.get("name", _cid)
+            _cell  = QFrame()
+            _cell.setStyleSheet(
+                f"QFrame {{ background: {C_PANEL}; border-radius: 6px; }}")
+            _cell_lay = QVBoxLayout(_cell)
+            _cell_lay.setContentsMargins(0, 0, 0, 0)
+            _cell_lay.setSpacing(0)
+            _title = QLabel(f"  {_cname}")
+            _title.setStyleSheet(
+                f"color: {C_MUTED}; font-size: 10px; font-weight: 600;"
+                " padding: 3px 6px;")
+            _title.setFixedHeight(18)
+            _vd = VideoDisplay()
+            _cell_lay.addWidget(_title)
+            _cell_lay.addWidget(_vd, stretch=1)
+            self._video_displays[_cid] = _vd
+            _row, _col = divmod(_i, _cols)
+            _video_grid.addWidget(_cell, _row, _col)
+        # backward compat
+        self.video = next(iter(self._video_displays.values()), VideoDisplay())
+
         self.log_panel = LogPanel()
 
         splitter.addWidget(self.emp_panel)
-        splitter.addWidget(self.video)
+        splitter.addWidget(_video_container)
         splitter.addWidget(self.log_panel)
         splitter.setStretchFactor(1, 1)
 
@@ -2581,14 +3194,20 @@ class MainWindow(QMainWindow):
         self.unknown_panel = UnknownPersonsPanel(frames_dir=frames_dir)
         main_tabs.addTab(self.unknown_panel, "👤  Unknown Persons")
 
+        # ── Tab 3: VIP Staff ──────────────────────────────────
+        self.vip_panel = VIPPanel(db=self.db)
+        self.vip_panel.vip_changed.connect(self.worker.rebuild_index)
+        main_tabs.addTab(self.vip_panel, "⭐  VIP Staff")
+
         root.addWidget(main_tabs, stretch=1)
 
     # ── Signal handlers ──────────────────────────────────────
 
     def _refresh_display(self) -> None:
-        frame = self.worker.get_latest_annotated_frame()
-        if frame is not None:
-            self.video.update_frame(frame)
+        for cam_id, display in self._video_displays.items():
+            frame = self.worker.get_latest_annotated_frame(cam_id)
+            if frame is not None:
+                display.update_frame(frame)
 
     def _on_detection(self, event: Dict) -> None:
         self.log_panel.add_event(event)
@@ -2678,7 +3297,7 @@ class MainWindow(QMainWindow):
 
     # ── Window close ─────────────────────────────────────────
 
-    def closeEvent(self, event) -> None:
+    def closeEvent(self, a0) -> None:
         self.worker.stop()
         self.worker.wait(4_000)
         try:
@@ -2690,10 +3309,15 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         try:
+            if self._alarm_svc:
+                self._alarm_svc.stop()
+        except Exception:
+            pass
+        try:
             self._attendance_exporter.stop()
         except Exception:
             pass
-        super().closeEvent(event)
+        super().closeEvent(a0)
 
 
 # ─────────────────────────────────────────────────────────────

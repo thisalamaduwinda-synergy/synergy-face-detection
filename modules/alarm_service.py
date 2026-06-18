@@ -171,25 +171,101 @@ class AlarmService:
         sound = self.sound.strip().lower()
 
         if sound == "beep":
-            # Beep is local-only (no camera equivalent)
             self._beep_alarm()
             return
 
         if sound == "voice":
             self._play_voice_alarm()
         else:
-            # Treat as WAV file path
             self._play_wav_alarm(self.sound)
 
-    # ── Beep (local only) ────────────────────────────────────
+    # ── Beep ─────────────────────────────────────────────────
 
     def _beep_alarm(self) -> None:
+        """Play beep locally and/or push synthesized tone to camera speaker."""
+        # Local beep
+        if self.output in ("local", "both"):
+            try:
+                import winsound
+                winsound.Beep(self.beep_frequency, self.beep_duration)
+                logger.info("Alarm: beep (%d Hz, %d ms)", self.beep_frequency, self.beep_duration)
+            except Exception as exc:
+                logger.warning("Alarm local beep failed: %s", exc)
+
+        # Camera beep — synthesize sine wave → G.711 → ISAPI push
+        if self.output in ("camera", "both", "sdk") and self.cam_host:
+            cam_thread = threading.Thread(
+                target=self._push_beep_to_camera,
+                daemon=True,
+            )
+            cam_thread.start()
+            cam_thread.join(timeout=10)
+
+    def _push_beep_to_camera(self) -> None:
+        """Generate a sine-wave beep as G.711 μ-law and push to camera speaker."""
+        import math, struct
         try:
-            import winsound
-            winsound.Beep(self.beep_frequency, self.beep_duration)
-            logger.info("Alarm: beep (%d Hz, %d ms)", self.beep_frequency, self.beep_duration)
+            sample_rate = 8000
+            freq        = self.beep_frequency
+            duration_s  = self.beep_duration / 1000.0
+            num_samples = int(sample_rate * duration_s)
+
+            # Generate 16-bit PCM sine wave
+            pcm = struct.pack(
+                f"<{num_samples}h",
+                *[
+                    int(32767 * math.sin(2 * math.pi * freq * i / sample_rate))
+                    for i in range(num_samples)
+                ],
+            )
+
+            # PCM 16-bit → G.711 μ-law
+            ulaw = audioop.lin2ulaw(pcm, 2)
+
+            self._push_wav_to_camera_ulaw(ulaw)
+            logger.info("Alarm: beep pushed to camera (%d Hz, %d ms)", self.beep_frequency, self.beep_duration)
+
         except Exception as exc:
-            logger.warning("Alarm beep failed: %s", exc)
+            logger.warning("Camera beep push failed: %s", exc)
+
+    def _push_wav_to_camera_ulaw(self, ulaw_data: bytes) -> None:
+        """Push raw G.711 μ-law bytes to Hikvision camera speaker via ISAPI."""
+        base = f"http://{self.cam_host}"
+        ch   = self.cam_channel
+        auth = httpx.DigestAuth(self.cam_user, self.cam_password)
+
+        xml_cfg = (
+            f'<?xml version="1.0" encoding="UTF-8"?>'
+            f'<TwoWayAudioChannel version="2.0" '
+            f'xmlns="http://www.hikvision.com/ver20/XMLSchema">'
+            f'<id>{ch}</id><enabled>true</enabled>'
+            f'<audioCompressionType>G.711ulaw</audioCompressionType>'
+            f'<speakerVolume>100</speakerVolume><microphoneVolume>100</microphoneVolume>'
+            f'<noisereduce>false</noisereduce>'
+            f'<audioInputType>MicIn</audioInputType>'
+            f'<audioOutputType>Speaker</audioOutputType>'
+            f'</TwoWayAudioChannel>'
+        )
+
+        try:
+            with httpx.Client(auth=auth) as client:
+                client.put(
+                    f"{base}/ISAPI/System/TwoWayAudio/channels/{ch}",
+                    content=xml_cfg.encode(),
+                    headers={"Content-Type": "application/xml"},
+                    timeout=10,
+                )
+                try:
+                    client.put(
+                        f"{base}/ISAPI/System/TwoWayAudio/channels/{ch}/audioData",
+                        content=ulaw_data,
+                        headers={"Content-Type": "application/octet-stream"},
+                        timeout=httpx.Timeout(connect=10, read=15, write=15, pool=10),
+                    )
+                except httpx.TimeoutException:
+                    pass  # camera held connection open = audio accepted
+        except Exception as exc:
+            logger.warning("Camera beep ISAPI failed: %s", exc)
 
     # ── Voice alarm ──────────────────────────────────────────
 

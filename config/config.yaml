@@ -15,15 +15,13 @@ attendance:
   confidence_threshold: 0.6
   reports_dir: reports
   shift_end: null
-  shift_start: null
+  shift_start: 08:15
 cameras:
 - fps: 25
-  id: cam_ip_01
-  name: Main Entrance
-  resize_height: 720
-  resize_width: 1280
-  rtsp_transport: udp
-  source: rtsp://admin:Synergy2026@192.168.1.64:554/Streaming/Channels/101
+  id: Entrance
+  name: Entrance
+  rtsp_transport: tcp
+  source: rtsp://admin:Synergy2026@169.254.18.90:554/Streaming/Channels/101
 dashboard:
   enabled: true
   host: 0.0.0.0
@@ -40,22 +38,37 @@ database:
   type: sqlite
 detection:
   backend: insightface
-  det_thresh: 0.5
+  det_thresh: 0.6
   insightface_det_size:
-  - 640
-  - 640
+  - 320
+  - 320
   insightface_model: buffalo_l
   insightface_root: data/models/insightface
   min_face_size: 20
   nms_thresh: 0.4
   sface_model: data/models/face_recognition_sface_2021dec.onnx
   yunet_model: data/models/face_detection_yunet_2023mar.onnx
+email:
+  attach_excel: true
+  enabled: true
+  recipients:
+  - thisala.maduwinda@synergypharma.lk
+  sender: thisala.maduwinda@synergypharma.lk
+  smtp_host: smtp.office365.com
+  smtp_port: 587
+  subject_prefix: Daily Attendance Report - Synergy Pharma
+  use_tls: true
 greeting:
+  camera_channel: 1
+  camera_host: 169.254.18.90
+  camera_password: Synergy2026
+  camera_user: admin
   cooldown_seconds: 0
   enabled: true
-  output: local
+  output: both
   template: Hi, {name}
   tts_engine: edge
+  vip_template: Welcome, {name}. Please proceed to the reception.
   voice_index: 1
   voice_name: en-US-AriaNeural
   voice_rate: 160
@@ -68,14 +81,14 @@ logging:
   log_unknown_frames: true
   max_size_mb: 100
 performance:
-  batch_size: 8
-  display_results: true
+  batch_size: 4
+  display_results: false
   frame_skip: 1
   num_threads: 4
   use_gpu: false
 recognition:
   embedding_dim: 512
-  threshold: 0.5
+  threshold: 0.6
 redis:
   cache_ttl: 300
   db: 0
